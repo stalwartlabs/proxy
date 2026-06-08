@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+# check=skip=FromPlatformFlagConstDisallowed,RedundantTargetPlatform
+
+# *****************
+# Base image for planner & builder
+# *****************
+FROM --platform=$BUILDPLATFORM rust:slim-trixie AS base
+
+ENV DEBIAN_FRONTEND="noninteractive" \
+    BINSTALL_DISABLE_TELEMETRY=true \
+    CARGO_TERM_COLOR=always \
+    LANG=C.UTF-8 \
+    TZ=UTC \
+    TERM=xterm-256color \
+    AWS_LC_SYS_PREBUILT_NASM=1
+# With zig, we only need libclang and make. ca-certificates is required for curl
+# to verify HTTPS downloads (zig tarballs, crates.io, etc).
+RUN \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
+    apt-get update && \
+    apt-get install -yq --no-install-recommends ca-certificates curl jq xz-utils make libclang-19-dev
+# Zig is pinned to 0.13.0. Zig 0.14+ changed how its default target ABI is
+# resolved for `x86_64-linux-gnu`-style triples, and on this dependency tree
+# (aws-lc-sys, libsqlite3-sys, rust-std 1.87+) that surfaces as ld.lld
+# undefined references to glibc 2.33+ symbols. Zig 0.13 produces binaries with
+# a max glibc ref of ~2.28 which stays compatible with Debian 11 / RHEL 8.
+RUN \
+    ZIG_VERSION=0.13.0 && \
+    curl --retry 5 -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz" | tar -J -x -C /usr/local && \
+    ln -s "/usr/local/zig-linux-$(uname -m)-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
+    zig version
+# Install cargo-binstall
+RUN curl --retry 5 -fL --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+# Install cargo-chef & sccache & cargo-zigbuild
+RUN cargo binstall --no-confirm cargo-chef sccache cargo-zigbuild
+
+# *****************
+# Planner
+# *****************
+FROM base AS planner
+WORKDIR /app
+COPY . .
+# Generate recipe file
+RUN cargo chef prepare --recipe-path recipe.json
+
+# *****************
+# Builder
+# *****************
+FROM base AS builder
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+ARG TARGET
+ARG BUILD_ENV
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Install toolchain and specify some env variables
+RUN \
+    rustup set profile minimal && \
+    rustup target add ${TARGET} && \
+    mkdir -p artifact && \
+    touch /env-cargo && \
+    if [ ! -z "${BUILD_ENV}" ]; then \
+        echo "export ${BUILD_ENV}" >> /env-cargo; \
+        echo "Setting up ${BUILD_ENV}"; \
+    fi
+# Cargo-chef cache layer
+RUN \
+    --mount=type=secret,id=ACTIONS_RESULTS_URL,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN,env=ACTIONS_RUNTIME_TOKEN \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    source /env-cargo && \
+    cargo chef cook --recipe-path recipe.json --zigbuild --release --target ${TARGET} -p proxy
+# Copy the source code
+COPY . .
+ENV RUSTC_WRAPPER="sccache" \
+    SCCACHE_GHA_ENABLED=true
+# Build
+RUN \
+    --mount=type=secret,id=ACTIONS_RESULTS_URL,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN,env=ACTIONS_RUNTIME_TOKEN \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    source /env-cargo && \
+    cargo zigbuild --release --target ${TARGET} -p proxy && \
+    mv /app/target/${TARGET}/release/proxy /app/artifact/proxy
+
+# *****************
+# Binary stage
+# *****************
+FROM scratch AS binaries
+COPY --from=builder /app/artifact /
+
+# *****************
+# Runtime image for GNU targets
+# *****************
+FROM --platform=$TARGETPLATFORM docker.io/library/debian:trixie-slim AS gnu
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -yq --no-install-recommends ca-certificates curl tzdata libcap2-bin && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r -g 2000 stalwart-proxy && \
+    useradd -r -u 2000 -g 2000 -s /usr/sbin/nologin -M stalwart-proxy && \
+    mkdir -p /etc/proxy && \
+    chown stalwart-proxy:stalwart-proxy /etc/proxy
+COPY --from=builder --chmod=0755 /app/artifact/proxy /usr/local/bin/proxy
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/proxy
+USER stalwart-proxy
+WORKDIR /etc/proxy
+VOLUME ["/etc/proxy"]
+EXPOSE	24 25 110 143 465 587 993 995 4190 443 9443
+ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsSk "$PROXY_HEALTHCHECK_URL" || exit 1
+ENTRYPOINT ["/usr/local/bin/proxy"]
+CMD ["/etc/proxy/config.toml"]
+
+# *****************
+# Runtime image for musl targets
+# *****************
+FROM --platform=$TARGETPLATFORM alpine AS musl
+RUN apk add --update --no-cache ca-certificates curl tzdata libcap && \
+    rm -rf /var/cache/apk/* && \
+    addgroup -S -g 2000 stalwart-proxy && \
+    adduser -S -D -H -u 2000 -G stalwart-proxy -s /sbin/nologin stalwart-proxy && \
+    mkdir -p /etc/proxy && \
+    chown stalwart-proxy:stalwart-proxy /etc/proxy
+COPY --from=builder --chmod=0755 /app/artifact/proxy /usr/local/bin/proxy
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/proxy
+USER stalwart-proxy
+WORKDIR /etc/proxy
+VOLUME ["/etc/proxy"]
+EXPOSE	24 25 110 143 465 587 993 995 4190 443 9443
+ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsSk "$PROXY_HEALTHCHECK_URL" || exit 1
+ENTRYPOINT ["/usr/local/bin/proxy"]
+CMD ["/etc/proxy/config.toml"]

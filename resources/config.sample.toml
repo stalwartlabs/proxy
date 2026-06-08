@@ -1,0 +1,167 @@
+# Migration proxy sample configuration.
+#
+# This is a starting template. Edit the destinations, mappings, TLS
+# certificates and admin token to match your deployment, then start the
+# service. The proxy refuses to boot until every referenced destination,
+# certificate and credential path is valid (see SPEC section 8.4).
+#
+# Run with:   proxy /etc/proxy/config.toml
+# Or set:     PROXY_CONFIG=/etc/proxy/config.toml
+
+[server]
+# Worker threads (0 = one per CPU).
+threads = 0
+# Hostname advertised in protocol greetings; defaults to the local IP.
+hostname = "proxy.example.com"
+shutdown_grace = "30s"
+log_level = "info"
+
+# TLS certificates used to TERMINATE inbound implicit-TLS and STARTTLS.
+# Multiple certificates are selected by SNI. Mark one as the default.
+[tls.certificate.default]
+cert = "/etc/proxy/tls/fullchain.pem"
+key = "/etc/proxy/tls/privkey.pem"
+default = true
+
+[tls.protocols]
+min_version = "1.2"
+
+# ---------------------------------------------------------------------------
+# Routing: which destination handles an identifier when it is missing or
+# unmapped, and (optionally) where raw SMTP/25 and LMTP/24 traffic is sent.
+# ---------------------------------------------------------------------------
+[routing]
+default_destination = "legacy"
+# smtp_passthrough_destination = "stalwart"
+
+# ---------------------------------------------------------------------------
+# Mappings: identifier -> destination id. Source is "file", "redis" or "sql".
+# ---------------------------------------------------------------------------
+[mapping]
+source = "file"
+normalize = "lowercase"
+negative_ttl = "30s"
+positive_ttl = "10m"
+
+[mapping.file]
+path = "/etc/proxy/mappings.tsv"
+
+# [mapping.redis]
+# url = "redis://10.0.0.5:6379"
+# key_prefix = "route:"
+
+# [mapping.sql]
+# url = "postgres://user:pass@10.0.0.6/proxy"
+# query = "SELECT destination FROM routes WHERE identifier = $1"
+
+# ---------------------------------------------------------------------------
+# Destinations. The default destination must support every listener protocol
+# declared below. Each destination lists the per-protocol backend port and the
+# TLS mode the proxy must use on the OUTBOUND leg.
+# ---------------------------------------------------------------------------
+[destination.legacy]
+host = "10.0.1.10"
+tls_server_name = "mail.legacy.example.com"
+proxy_protocol = true
+
+[destination.legacy.protocol.imap]
+port = 993
+tls = "implicit"
+[destination.legacy.protocol.pop3]
+port = 995
+tls = "implicit"
+[destination.legacy.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.legacy.protocol.managesieve]
+port = 4190
+tls = "starttls"
+[destination.legacy.protocol.http]
+port = 443
+tls = "implicit"
+
+[destination.stalwart]
+host = "10.0.1.20"
+tls_server_name = "mail.new.example.com"
+proxy_protocol = true
+
+[destination.stalwart.protocol.imap]
+port = 993
+tls = "implicit"
+[destination.stalwart.protocol.pop3]
+port = 995
+tls = "implicit"
+[destination.stalwart.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.stalwart.protocol.managesieve]
+port = 4190
+tls = "starttls"
+[destination.stalwart.protocol.http]
+port = 443
+tls = "implicit"
+
+# ---------------------------------------------------------------------------
+# Listeners: one entry per protocol + TLS mode + bind set.
+# tls = "implicit" | "starttls" | "plain".
+# ---------------------------------------------------------------------------
+[listener.imap]
+protocol = "imap"
+bind = ["0.0.0.0:993", "[::]:993"]
+tls = "implicit"
+
+[listener.imap-starttls]
+protocol = "imap"
+bind = ["0.0.0.0:143", "[::]:143"]
+tls = "starttls"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["0.0.0.0:995", "[::]:995"]
+tls = "implicit"
+
+[listener.submission]
+protocol = "submission"
+bind = ["0.0.0.0:587", "[::]:587"]
+tls = "starttls"
+
+[listener.submissions]
+protocol = "submission"
+bind = ["0.0.0.0:465", "[::]:465"]
+tls = "implicit"
+
+[listener.managesieve]
+protocol = "managesieve"
+bind = ["0.0.0.0:4190", "[::]:4190"]
+tls = "starttls"
+
+[listener.https]
+protocol = "http"
+bind = ["0.0.0.0:443", "[::]:443"]
+tls = "implicit"
+forwarded = "off"
+
+# ---------------------------------------------------------------------------
+# HTTP routing rules. First match wins. A rule pins a destination by path, or
+# extracts an account identifier and routes it through the mapping store.
+# ---------------------------------------------------------------------------
+[[http.route]]
+match = "/.well-known/**"
+destination = "legacy"
+
+[[http.route]]
+match = "/**"
+extract = { from = "authorization" }
+fallback = "default"
+
+# ---------------------------------------------------------------------------
+# Admin listener: the cache-integrity boundary. Bind to loopback or a dedicated
+# management network only. TLS is mandatory; plaintext admin is rejected.
+# ---------------------------------------------------------------------------
+[admin]
+bind = "127.0.0.1:9443"
+tls = "implicit"
+bearer_token_file = "/etc/proxy/admin.token"
+min_token_len = 32
+lockout_threshold = 5
+lockout_duration = "5m"

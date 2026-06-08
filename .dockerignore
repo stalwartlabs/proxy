@@ -1,0 +1,7 @@
+# Ignore everything by default
+*
+
+# Allow only what the build needs
+!src
+!Cargo.toml
+!Cargo.lock

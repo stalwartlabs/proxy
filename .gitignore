@@ -1,0 +1,5 @@
+/target
+.ignore
+*.md
+!CHANGELOG.md
+!README.md
