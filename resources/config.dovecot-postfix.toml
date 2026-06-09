@@ -1,0 +1,176 @@
+# ===========================================================================
+# Migration proxy: Dovecot + Postfix to Stalwart sample configuration.
+#
+# This configuration fronts a legacy mail stack (Dovecot serving IMAP, POP3 and
+# ManageSieve, Postfix handling SMTP submission) and a new Stalwart server at the
+# same time, migrating accounts from the legacy stack to Stalwart one at a time.
+# Clients keep talking to a single hostname on the usual ports; the proxy decides
+# per account which backend currently holds the mailbox.
+#
+# The legacy backend speaks the Dovecot and Postfix conventions: it expects the
+# real client address through the XCLIENT command (and the IMAP ID command), not
+# through a PROXY protocol header. The legacy destination therefore uses
+# forwarding = "xclient", while the Stalwart destination uses forwarding =
+# "proxy". For XCLIENT to be honoured, Dovecot and Postfix must be told to trust
+# the proxy; see the companion file resources/dovecot-postfix-trust.conf.
+#
+# Inbound mail on port 25 is handed to Stalwart, which performs split delivery:
+# mail for a migrated account is delivered locally, and mail for an account still
+# on the legacy stack is relayed back to Postfix.
+#
+# Replace every value marked CHANGE ME and review the rest before starting.
+# ===========================================================================
+
+[server]
+hostname = "mail.example.com"          # CHANGE ME (public hostname clients use)
+shutdown_grace = "30s"
+log_level = "info"
+
+# TLS certificate the proxy presents to clients (the public hostname's cert).
+[tls.certificate.default]
+cert = "/etc/proxy/tls/fullchain.pem"  # CHANGE ME
+key = "/etc/proxy/tls/privkey.pem"     # CHANGE ME
+default = true
+
+[tls.protocols]
+min_version = "1.2"
+
+# ---------------------------------------------------------------------------
+# Routing.
+#
+# default_destination is "legacy" so that accounts not yet migrated resolve to
+# the Dovecot/Postfix stack. As each account is migrated, an entry pointing it at
+# "stalwart" is added to the mapping file.
+#
+# smtp_passthrough_destination is "stalwart": port 25 carries no login to route
+# on, so it is handed whole to the new server, which performs split delivery and
+# relays not-yet-migrated recipients back to Postfix.
+# ---------------------------------------------------------------------------
+[routing]
+default_destination = "legacy"
+smtp_passthrough_destination = "stalwart"
+
+[mapping]
+source = "file"
+normalize = "lowercase"
+positive_ttl = "10m"
+negative_ttl = "30s"
+
+[mapping.file]
+# Whitespace-separated "identifier  destination" lines. A migrated account gets a
+# line pointing it at "stalwart"; everything else falls through to "legacy". For
+# example:
+#   alice@example.com   stalwart
+path = "/etc/proxy/mappings.tsv"       # CHANGE ME
+
+# ---------------------------------------------------------------------------
+# Legacy Dovecot + Postfix backend. Announced to the backend over XCLIENT and the
+# IMAP ID command (forwarding = "xclient"), which is what Dovecot and Postfix
+# understand. The backend leg uses STARTTLS on the classic plaintext ports.
+#
+# The legacy server presents a self-signed certificate. Pin it by fingerprint
+# with tls_pinned_cert_sha256 (recommended), or, on a trusted internal network,
+# set tls_allow_invalid_certs = true.
+# ---------------------------------------------------------------------------
+[destination.legacy]
+host = "legacy.internal.example.com"   # CHANGE ME (internal address of the legacy stack)
+tls_server_name = "legacy.internal.example.com"
+forwarding = "xclient"
+# tls_pinned_cert_sha256 = "aa:bb:...:99"   # CHANGE ME (legacy cert SHA-256), or:
+tls_allow_invalid_certs = true
+
+[destination.legacy.protocol.imap]
+port = 143
+tls = "starttls"
+[destination.legacy.protocol.pop3]
+port = 110
+tls = "starttls"
+[destination.legacy.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.legacy.protocol.managesieve]
+port = 4190
+tls = "starttls"
+
+# ---------------------------------------------------------------------------
+# New Stalwart backend. Announced over the PROXY protocol (forwarding = "proxy",
+# proxy_protocol = true); Stalwart is configured to trust the proxy's address.
+# Declares an smtp endpoint because it is the pass-through destination for port 25.
+# ---------------------------------------------------------------------------
+[destination.stalwart]
+host = "new.internal.example.com"      # CHANGE ME (internal address of the new server)
+tls_server_name = "new.internal.example.com"
+forwarding = "proxy"
+proxy_protocol = true
+forwarded = true
+# tls_allow_invalid_certs = true       # if the new server uses a self-signed cert
+
+[destination.stalwart.protocol.imap]
+port = 993
+tls = "implicit"
+[destination.stalwart.protocol.pop3]
+port = 995
+tls = "implicit"
+[destination.stalwart.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.stalwart.protocol.managesieve]
+port = 4190
+tls = "starttls"
+[destination.stalwart.protocol.smtp]
+port = 25
+tls = "plain"
+
+# ---------------------------------------------------------------------------
+# Client-facing listeners on the familiar ports. Port 25 is a raw pass-through to
+# Stalwart and therefore plain (a pass-through listener cannot offer STARTTLS).
+#
+# Note: Dovecot and Postfix serve no HTTP or JMAP, so no HTTP listener is defined
+# here. Once accounts are on Stalwart, JMAP and the web interface are served by
+# the new server; an HTTP listener routing to "stalwart" can be added at that
+# point if a single hostname for web access is wanted.
+# ---------------------------------------------------------------------------
+[listener.imaps]
+protocol = "imap"
+bind = ["0.0.0.0:993", "[::]:993"]
+tls = "implicit"
+[listener.imap]
+protocol = "imap"
+bind = ["0.0.0.0:143", "[::]:143"]
+tls = "starttls"
+[listener.pop3s]
+protocol = "pop3"
+bind = ["0.0.0.0:995", "[::]:995"]
+tls = "implicit"
+[listener.pop3]
+protocol = "pop3"
+bind = ["0.0.0.0:110", "[::]:110"]
+tls = "starttls"
+[listener.submission]
+protocol = "submission"
+bind = ["0.0.0.0:587", "[::]:587"]
+tls = "starttls"
+[listener.submissions]
+protocol = "submission"
+bind = ["0.0.0.0:465", "[::]:465"]
+tls = "implicit"
+[listener.managesieve]
+protocol = "managesieve"
+bind = ["0.0.0.0:4190", "[::]:4190"]
+tls = "starttls"
+[listener.smtp]
+protocol = "smtp"
+bind = ["0.0.0.0:25", "[::]:25"]
+tls = "plain"
+
+# ---------------------------------------------------------------------------
+# Management API: mapping changes, cache invalidation and connection control.
+# TLS is mandatory. Bind to loopback or a trusted management network only.
+# ---------------------------------------------------------------------------
+[admin]
+bind = "127.0.0.1:9443"
+tls = "implicit"
+bearer_token_file = "/etc/proxy/admin.token"  # CHANGE ME
+min_token_len = 32
+lockout_threshold = 5
+lockout_duration = "5m"

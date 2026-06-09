@@ -1,0 +1,252 @@
+# ===========================================================================
+# Migration proxy: Stalwart upgrade (old -> new) sample configuration.
+#
+# This configuration fronts two Stalwart deployments at the same time: an older
+# one ("old", typically v0.15 or below) that still holds most accounts, and a
+# new one ("new", the latest release) that accounts are migrated onto one by
+# one. Clients keep talking to a single hostname on the usual ports; the proxy
+# decides per account which deployment currently holds the mailbox.
+#
+# Before each account is migrated, it resolves to "old". Inbound mail on port 25
+# is always handed to "new", which performs split delivery: mail for an account
+# that already lives on "new" is delivered locally, while mail for an account
+# still on "old" is relayed there. As each account is moved its mapping is
+# flipped to "new".
+#
+# Replace every value marked CHANGE ME and review the rest before starting.
+# ===========================================================================
+
+[server]
+# Public hostname clients connect to. Advertised in protocol greetings.
+hostname = "mail.example.org"          # CHANGE ME
+shutdown_grace = "30s"
+log_level = "info"
+
+# TLS certificate the proxy presents to clients. This is the certificate for
+# the public hostname above; it terminates implicit TLS and STARTTLS.
+[tls.certificate.default]
+cert = "/etc/proxy/tls/fullchain.pem"  # CHANGE ME
+key = "/etc/proxy/tls/privkey.pem"     # CHANGE ME
+default = true
+
+[tls.protocols]
+min_version = "1.2"
+
+# ---------------------------------------------------------------------------
+# Routing.
+#
+# default_destination is where accounts with no explicit mapping resolve. While
+# the migration is in progress this must be "old", so that accounts that have
+# not been moved yet keep reaching their current mailbox.
+#
+# smtp_passthrough_destination is the fixed target for raw SMTP on port 25 and
+# LMTP on port 24. It must be "new", because the new deployment is the one that
+# performs split delivery and relays not-yet-migrated recipients back to old.
+# ---------------------------------------------------------------------------
+[routing]
+default_destination = "old"
+smtp_passthrough_destination = "new"
+
+# ---------------------------------------------------------------------------
+# Mapping store: identifier -> destination. A migrated account gets a line
+# pointing it at "new"; everything else falls through to default_destination.
+# The identifier is the login the client presents (the e-mail address, or for
+# older servers the bare account name), normalized to lowercase.
+# ---------------------------------------------------------------------------
+[mapping]
+source = "file"
+normalize = "lowercase"
+positive_ttl = "10m"
+negative_ttl = "30s"
+
+[mapping.file]
+# A whitespace-separated file of "identifier  destination" lines, for example:
+#   alice@example.org   new
+#   alice               new
+# List both the e-mail address and the bare account name when the old server
+# allowed logging in with either form. New entries take effect after a mapping
+# reload (see the management API) or a cache expiry.
+path = "/etc/proxy/mappings.tsv"       # CHANGE ME
+
+# ---------------------------------------------------------------------------
+# Destinations.
+#
+# Both backends are Stalwart and both are configured to accept the PROXY
+# protocol on their listeners, so the proxy announces the real client over a
+# PROXY v2 header (forwarding = "proxy", proxy_protocol = true) on every mail
+# leg, and appends Forwarded / X-Forwarded-For on the HTTP leg (forwarded =
+# true). The old server is the single exception: its port 25 must NOT expect a
+# PROXY header, because the new server relays to it as an ordinary SMTP client.
+# That exception is configured on the old server, not here.
+#
+# host is the internal address each deployment now listens on. tls_server_name
+# is the name presented for SNI and certificate matching on the backend leg.
+# If a backend uses a self-signed or internal certificate, either pin it with
+# tls_pinned_cert_sha256 or, for a trusted internal network only, uncomment
+# tls_allow_invalid_certs.
+# ---------------------------------------------------------------------------
+[destination.old]
+host = "old.internal.example.org"      # CHANGE ME
+tls_server_name = "old.internal.example.org"
+forwarding = "proxy"
+proxy_protocol = true
+forwarded = true
+# tls_allow_invalid_certs = true
+
+[destination.old.protocol.imap]
+port = 993
+tls = "implicit"
+[destination.old.protocol.pop3]
+port = 995
+tls = "implicit"
+[destination.old.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.old.protocol.managesieve]
+port = 4190
+tls = "starttls"
+[destination.old.protocol.http]
+port = 443
+tls = "implicit"
+
+[destination.new]
+host = "new.internal.example.org"      # CHANGE ME
+tls_server_name = "new.internal.example.org"
+forwarding = "proxy"
+proxy_protocol = true
+forwarded = true
+# tls_allow_invalid_certs = true
+
+[destination.new.protocol.imap]
+port = 993
+tls = "implicit"
+[destination.new.protocol.pop3]
+port = 995
+tls = "implicit"
+[destination.new.protocol.submission]
+port = 587
+tls = "starttls"
+[destination.new.protocol.managesieve]
+port = 4190
+tls = "starttls"
+[destination.new.protocol.http]
+port = 443
+tls = "implicit"
+# Required because new is the smtp_passthrough_destination (port 25 / LMTP).
+[destination.new.protocol.smtp]
+port = 25
+tls = "plain"
+
+# ---------------------------------------------------------------------------
+# HTTP routing. Rules are evaluated top to bottom and the first match wins.
+#
+# The web interfaces and login endpoints differ between the two versions, so a
+# handful of paths that are unique to each version are pinned to the backend
+# that serves them. The OAuth token exchange is shared, so it is split by the
+# client_id present in the request body. Everything else, including JMAP,
+# WebDAV and the JMAP session resource, carries credentials and is routed by
+# the account those credentials identify, falling back to the default
+# destination when no account can be determined.
+# ---------------------------------------------------------------------------
+
+# Endpoints served only by the old deployment.
+[[http.route]]
+match = "/api/oauth"
+destination = "old"
+[[http.route]]
+match = "/authorize"
+destination = "old"
+[[http.route]]
+match = "/authorize/**"
+destination = "old"
+
+# Endpoints served only by the new deployment.
+[[http.route]]
+match = "/api/auth"
+destination = "new"
+[[http.route]]
+match = "/api/discover/**"
+destination = "new"
+[[http.route]]
+match = "/admin/**"
+destination = "new"
+[[http.route]]
+match = "/account/**"
+destination = "new"
+[[http.route]]
+match = "/login"
+destination = "new"
+[[http.route]]
+match = "/device"
+destination = "new"
+
+# OAuth token exchange is shared; route it by the web client that requested it.
+# Add matching mapping entries:  webadmin  old   and   stalwart-webui  new
+[[http.route]]
+match = "/auth/token"
+extract = { from = "body", regex = "client_id=([^&]+)" }
+fallback = "old"
+
+# Everything else: route by the authenticated account, fall back to default.
+[[http.route]]
+match = "/**"
+extract = { from = "authorization" }
+fallback = "default"
+
+# ---------------------------------------------------------------------------
+# Listeners: the public ports clients connect to. These take over the ports the
+# old server used to answer on directly.
+# ---------------------------------------------------------------------------
+[listener.imaps]
+protocol = "imap"
+bind = ["0.0.0.0:993", "[::]:993"]
+tls = "implicit"
+[listener.imap]
+protocol = "imap"
+bind = ["0.0.0.0:143", "[::]:143"]
+tls = "starttls"
+[listener.pop3s]
+protocol = "pop3"
+bind = ["0.0.0.0:995", "[::]:995"]
+tls = "implicit"
+[listener.pop3]
+protocol = "pop3"
+bind = ["0.0.0.0:110", "[::]:110"]
+tls = "starttls"
+[listener.submission]
+protocol = "submission"
+bind = ["0.0.0.0:587", "[::]:587"]
+tls = "starttls"
+[listener.submissions]
+protocol = "submission"
+bind = ["0.0.0.0:465", "[::]:465"]
+tls = "implicit"
+[listener.managesieve]
+protocol = "managesieve"
+bind = ["0.0.0.0:4190", "[::]:4190"]
+tls = "starttls"
+[listener.https]
+protocol = "http"
+bind = ["0.0.0.0:443", "[::]:443"]
+tls = "implicit"
+# Strip any Forwarded / X-Forwarded-For headers arriving from clients rather
+# than trusting them; the proxy sets its own based on the real peer.
+forwarded = "off"
+# Raw SMTP. Pass-through to new (smtp_passthrough_destination). Must be plain:
+# a pass-through listener cannot offer STARTTLS.
+[listener.smtp]
+protocol = "smtp"
+bind = ["0.0.0.0:25", "[::]:25"]
+tls = "plain"
+
+# ---------------------------------------------------------------------------
+# Management API: mapping changes, cache invalidation and connection control.
+# TLS is mandatory. Bind it to loopback or a trusted management network only.
+# ---------------------------------------------------------------------------
+[admin]
+bind = "127.0.0.1:9443"
+tls = "implicit"
+bearer_token_file = "/etc/proxy/admin.token"  # CHANGE ME
+min_token_len = 32
+lockout_threshold = 5
+lockout_duration = "5m"
