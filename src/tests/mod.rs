@@ -7,6 +7,7 @@
 mod admin;
 mod config_validation;
 mod containers;
+mod dest_health;
 mod forwarding;
 mod harness;
 mod http_proxy;

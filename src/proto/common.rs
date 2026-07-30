@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -141,7 +141,33 @@ pub struct DestHealth {
 #[derive(Default)]
 struct HealthState {
     consecutive_failures: u32,
+    failure_sources: AHashSet<IpAddr>,
+    host_level_failure: bool,
     down_until: Option<Instant>,
+}
+
+impl HealthState {
+    fn clear_evidence(&mut self) {
+        self.failure_sources.clear();
+        self.host_level_failure = false;
+    }
+}
+
+const MAX_TRACKED_FAILURE_SOURCES: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Attribution {
+    Host,
+    Client(IpAddr),
+}
+
+impl Attribution {
+    fn of(err: &ProxyError, peer: IpAddr) -> Self {
+        match err {
+            ProxyError::BackendConnect(_) => Attribution::Host,
+            _ => Attribution::Client(peer),
+        }
+    }
 }
 
 impl DestHealth {
@@ -154,26 +180,39 @@ impl DestHealth {
                 ));
             }
             st.down_until = None;
+            st.clear_evidence();
         }
         Ok(())
     }
 
-    fn record(&self, ok: bool, threshold: u32, cooldown: Duration) {
+    fn record_success(&self) {
         let mut st = self.inner.lock();
-        if ok {
-            st.consecutive_failures = 0;
-            st.down_until = None;
-        } else {
-            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
-            if threshold > 0 && st.consecutive_failures >= threshold {
-                st.down_until = Some(Instant::now() + cooldown);
+        st.consecutive_failures = 0;
+        st.clear_evidence();
+        st.down_until = None;
+    }
+
+    fn record_failure(&self, at: Attribution, limits: &HealthLimits) {
+        let mut st = self.inner.lock();
+        st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+        match at {
+            Attribution::Host => st.host_level_failure = true,
+            Attribution::Client(ip) => {
+                if st.failure_sources.len() < MAX_TRACKED_FAILURE_SOURCES {
+                    st.failure_sources.insert(ip);
+                }
             }
+        }
+        let broad = st.host_level_failure || st.failure_sources.len() as u32 >= limits.min_clients;
+        if limits.threshold > 0 && st.consecutive_failures >= limits.threshold && broad {
+            st.down_until = Some(Instant::now() + limits.cooldown);
         }
     }
 
     pub fn reset(&self) {
         let mut st = self.inner.lock();
         st.consecutive_failures = 0;
+        st.clear_evidence();
         st.down_until = None;
     }
 
@@ -182,13 +221,33 @@ impl DestHealth {
         let down = matches!(st.down_until, Some(until) if Instant::now() < until);
         HealthSnapshot {
             consecutive_failures: st.consecutive_failures,
+            failure_sources: st.failure_sources.len() as u32,
+            host_level_failure: st.host_level_failure,
             down,
+        }
+    }
+}
+
+pub struct HealthLimits {
+    threshold: u32,
+    min_clients: u32,
+    cooldown: Duration,
+}
+
+impl HealthLimits {
+    fn for_server(server: &crate::config::ServerConfig) -> Self {
+        HealthLimits {
+            threshold: server.host_down_threshold,
+            min_clients: server.host_down_min_clients,
+            cooldown: server.host_down_cooldown,
         }
     }
 }
 
 pub struct HealthSnapshot {
     pub consecutive_failures: u32,
+    pub failure_sources: u32,
+    pub host_level_failure: bool,
     pub down: bool,
 }
 
@@ -465,7 +524,12 @@ pub fn assert_egress_encrypted(
 
 const BACKEND_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-pub async fn establish<F, Fut, T>(ctx: &Ctx, dest_id: &str, mut open: F) -> Result<T>
+pub async fn establish<F, Fut, T>(
+    ctx: &Ctx,
+    dest_id: &str,
+    peer: SocketAddr,
+    mut open: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -475,6 +539,7 @@ where
     }
 
     let server = &ctx.config.server;
+    let limits = HealthLimits::for_server(server);
     let mut attempt: u32 = 0;
     loop {
         let outcome = match tokio::time::timeout(server.backend_timeout, open()).await {
@@ -487,7 +552,7 @@ where
         match outcome {
             Ok(value) => {
                 if let Some(health) = ctx.dest_health.get(dest_id) {
-                    health.record(true, server.host_down_threshold, server.host_down_cooldown);
+                    health.record_success();
                 }
                 return Ok(value);
             }
@@ -504,7 +569,15 @@ where
                     continue;
                 }
                 if let Some(health) = ctx.dest_health.get(dest_id) {
-                    health.record(false, server.host_down_threshold, server.host_down_cooldown);
+                    let at = Attribution::of(&err, peer.ip());
+                    if matches!(at, Attribution::Client(_)) {
+                        tracing::debug!(
+                            destination = %dest_id,
+                            error = %err,
+                            "backend failure attributed to the client, not counted as host evidence on its own"
+                        );
+                    }
+                    health.record_failure(at, &limits);
                 }
                 return Err(err);
             }
@@ -659,6 +732,7 @@ pub async fn bridge_authenticated<F, Fut>(
     ctx: &Ctx,
     dest_id: &str,
     mut stream: BoxedStream,
+    peer: SocketAddr,
     identifier: Option<&str>,
     client_residual: &[u8],
     started: Instant,
@@ -685,7 +759,7 @@ where
         return Ok(());
     }
 
-    let (mut backend, mut backend_residual) = match establish(ctx, dest_id, open).await {
+    let (mut backend, mut backend_residual) = match establish(ctx, dest_id, peer, open).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, protocol = label, destination = %dest_id, "backend unavailable");
@@ -854,27 +928,187 @@ mod tests {
         ));
     }
 
+    fn limits(threshold: u32, min_clients: u32, cooldown: Duration) -> HealthLimits {
+        HealthLimits {
+            threshold,
+            min_clients,
+            cooldown,
+        }
+    }
+
+    fn client(addr: &str) -> Attribution {
+        Attribution::Client(addr.parse().unwrap())
+    }
+
     #[test]
     fn dest_health_opens_after_threshold_and_recovers() {
         let h = DestHealth::default();
-        let cooldown = Duration::from_secs(60);
+        let lim = limits(3, 2, Duration::from_secs(60));
 
-        h.record(false, 3, cooldown);
-        h.record(false, 3, cooldown);
+        h.record_failure(Attribution::Host, &lim);
+        h.record_failure(Attribution::Host, &lim);
         assert!(h.gate().is_ok());
 
-        h.record(false, 3, cooldown);
+        h.record_failure(Attribution::Host, &lim);
         assert!(h.gate().is_err());
 
-        h.record(true, 3, cooldown);
+        h.record_success();
         assert!(h.gate().is_ok());
     }
 
     #[test]
     fn dest_health_cooldown_elapses_into_a_probe() {
         let h = DestHealth::default();
-        h.record(false, 1, Duration::from_secs(0));
+        h.record_failure(Attribution::Host, &limits(1, 2, Duration::from_secs(0)));
         assert!(h.gate().is_ok());
+    }
+
+    #[test]
+    fn attribution_follows_the_failure_stage() {
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(
+            Attribution::of(&ProxyError::backend_connect("refused"), ip),
+            Attribution::Host
+        );
+        assert_eq!(
+            Attribution::of(&ProxyError::backend("closed after PROXY header"), ip),
+            Attribution::Client(ip)
+        );
+        assert_eq!(
+            Attribution::of(
+                &ProxyError::backend_session("backend closed before sending a complete line"),
+                ip
+            ),
+            Attribution::Client(ip)
+        );
+        assert_eq!(
+            Attribution::of(
+                &ProxyError::backend_session("backend TLS handshake failed"),
+                ip
+            ),
+            Attribution::Client(ip)
+        );
+        assert_eq!(
+            Attribution::of(
+                &ProxyError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                ip
+            ),
+            Attribution::Client(ip)
+        );
+    }
+
+    #[test]
+    fn banned_client_alone_never_opens_the_breaker() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(60));
+        for _ in 0..50 {
+            h.record_failure(client("198.51.100.7"), &lim);
+        }
+        assert!(h.gate().is_ok());
+        let s = h.snapshot();
+        assert_eq!(s.consecutive_failures, 50);
+        assert_eq!(s.failure_sources, 1);
+        assert!(!s.down);
+    }
+
+    #[test]
+    fn failures_spanning_distinct_clients_open_the_breaker() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(60));
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("198.51.100.7"), &lim);
+        assert!(h.gate().is_ok());
+
+        h.record_failure(client("203.0.113.4"), &lim);
+        assert!(h.gate().is_err());
+        assert_eq!(h.snapshot().failure_sources, 2);
+    }
+
+    #[test]
+    fn host_level_failure_opens_the_breaker_without_breadth() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(60));
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(Attribution::Host, &lim);
+        assert!(h.gate().is_err());
+        let s = h.snapshot();
+        assert!(s.host_level_failure);
+        assert!(s.down);
+    }
+
+    #[test]
+    fn cooldown_expiry_clears_stale_evidence() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(0));
+        for _ in 0..3 {
+            h.record_failure(Attribution::Host, &lim);
+        }
+        assert!(h.gate().is_ok());
+        let s = h.snapshot();
+        assert!(!s.host_level_failure);
+        assert_eq!(s.failure_sources, 0);
+
+        h.record_failure(
+            client("198.51.100.7"),
+            &limits(3, 2, Duration::from_secs(60)),
+        );
+        assert!(h.gate().is_ok());
+    }
+
+    #[test]
+    fn cooldown_expiry_still_re_opens_on_a_failed_host_probe() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(0));
+        for _ in 0..3 {
+            h.record_failure(Attribution::Host, &lim);
+        }
+        assert!(h.gate().is_ok());
+
+        h.record_failure(Attribution::Host, &limits(3, 2, Duration::from_secs(60)));
+        assert!(h.gate().is_err());
+    }
+
+    #[test]
+    fn success_clears_the_failure_streak() {
+        let h = DestHealth::default();
+        let lim = limits(3, 2, Duration::from_secs(60));
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("203.0.113.4"), &lim);
+        h.record_success();
+        let s = h.snapshot();
+        assert_eq!(s.consecutive_failures, 0);
+        assert_eq!(s.failure_sources, 0);
+
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("198.51.100.7"), &lim);
+        h.record_failure(client("198.51.100.7"), &lim);
+        assert!(h.gate().is_ok());
+    }
+
+    #[test]
+    fn min_clients_zero_counts_failures_alone() {
+        let h = DestHealth::default();
+        let lim = limits(3, 0, Duration::from_secs(60));
+        for _ in 0..3 {
+            h.record_failure(client("198.51.100.7"), &lim);
+        }
+        assert!(h.gate().is_err());
+    }
+
+    #[test]
+    fn tracked_failure_sources_are_bounded() {
+        let h = DestHealth::default();
+        let lim = limits(0, 2, Duration::from_secs(60));
+        for i in 0..(MAX_TRACKED_FAILURE_SOURCES + 100) {
+            let ip = IpAddr::from([10, (i / 256) as u8, (i % 256) as u8, 1]);
+            h.record_failure(Attribution::Client(ip), &lim);
+        }
+        assert_eq!(
+            h.snapshot().failure_sources as usize,
+            MAX_TRACKED_FAILURE_SOURCES
+        );
     }
 
     #[tokio::test]
@@ -912,7 +1146,7 @@ mod tests {
     fn dest_health_threshold_zero_never_trips() {
         let h = DestHealth::default();
         for _ in 0..100 {
-            h.record(false, 0, Duration::from_secs(60));
+            h.record_failure(Attribution::Host, &limits(0, 2, Duration::from_secs(60)));
         }
         assert!(h.gate().is_ok());
     }

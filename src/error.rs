@@ -25,6 +25,9 @@ pub enum ProxyError {
     #[error("backend connection failed: {0}")]
     BackendConnect(Cow<'static, str>),
 
+    #[error("backend session failed: {0}")]
+    BackendSession(Cow<'static, str>),
+
     #[error("protocol error: {0}")]
     Protocol(Cow<'static, str>),
 
@@ -52,8 +55,15 @@ impl ProxyError {
         ProxyError::BackendConnect(msg.into())
     }
 
+    pub fn backend_session(msg: impl Into<Cow<'static, str>>) -> Self {
+        ProxyError::BackendSession(msg.into())
+    }
+
     pub fn is_retryable(&self) -> bool {
-        matches!(self, ProxyError::BackendConnect(_) | ProxyError::Io(_))
+        matches!(
+            self,
+            ProxyError::BackendConnect(_) | ProxyError::BackendSession(_) | ProxyError::Io(_)
+        )
     }
 
     pub fn protocol(msg: impl Into<Cow<'static, str>>) -> Self {

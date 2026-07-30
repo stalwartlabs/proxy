@@ -12,7 +12,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::http::{self, basic_auth};
-use super::pick_free_port;
+use super::{owner_labels, pick_free_port};
 
 pub const NEW_IMAGE: &str = "stalwartlabs/stalwart";
 pub const NEW_TAG: &str = "latest";
@@ -114,6 +114,7 @@ impl Stalwart {
             .with_mapped_port(ports.sieve, 4190u16.tcp())
             .with_mapped_port(ports.smtp, 25u16.tcp())
             .with_startup_timeout(Duration::from_secs(180))
+            .with_labels(owner_labels())
             .start()
             .await
             .expect("start new stalwart");
@@ -196,6 +197,7 @@ impl Stalwart {
             .with_mapped_port(ports.sieve, 4190u16.tcp())
             .with_mapped_port(ports.smtp, 25u16.tcp())
             .with_startup_timeout(Duration::from_secs(180))
+            .with_labels(owner_labels())
             .start()
             .await
             .expect("start old stalwart");

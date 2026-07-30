@@ -7,11 +7,11 @@
 use std::time::Duration;
 
 use testcontainers::core::{ExecCommand, Host, WaitFor};
-use testcontainers::runners::{AsyncBuilder, AsyncRunner};
-use testcontainers::{ContainerAsync, GenericBuildableImage, GenericImage, ImageExt};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::io::AsyncReadExt;
 
-use super::HOST_GATEWAY;
+use super::{HOST_GATEWAY, ensure_image, owner_labels};
 
 const DOCKERFILE: &str = r#"FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive
@@ -54,16 +54,13 @@ impl Exec {
 
 impl Toolbox {
     pub async fn start() -> Toolbox {
-        let image: GenericImage = GenericBuildableImage::new("proxy-toolbox", "test")
-            .with_dockerfile_string(DOCKERFILE.to_string())
-            .build_image()
-            .await
-            .expect("build toolbox image");
+        let image = ensure_image("proxy-toolbox", DOCKERFILE, &[]).await;
 
         let container = image
             .with_wait_for(WaitFor::seconds(1))
             .with_startup_timeout(Duration::from_secs(300))
             .with_host(HOST_GATEWAY, Host::HostGateway)
+            .with_labels(owner_labels())
             .start()
             .await
             .expect("start toolbox container");

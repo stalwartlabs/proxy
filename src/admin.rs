@@ -237,6 +237,8 @@ async fn handle(
                     serde_json::json!({
                         "destination": id,
                         "consecutive_failures": s.consecutive_failures,
+                        "failure_sources": s.failure_sources,
+                        "host_level_failure": s.host_level_failure,
                         "down": s.down,
                     })
                 })

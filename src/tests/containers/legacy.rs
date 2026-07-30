@@ -7,9 +7,11 @@
 use std::time::Duration;
 
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::{AsyncBuilder, AsyncRunner};
-use testcontainers::{ContainerAsync, GenericBuildableImage, GenericImage, ImageExt};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::net::TcpStream;
+
+use super::{ensure_image, owner_labels};
 
 pub const MASTER_USER: &str = "admin";
 pub const MASTER_PASSWORD: &str = "MasterPass#2026";
@@ -218,15 +220,17 @@ pub struct Legacy {
 
 impl Legacy {
     pub async fn start() -> Legacy {
-        let image: GenericImage = GenericBuildableImage::new("proxy-legacymail", "test")
-            .with_dockerfile_string(DOCKERFILE.to_string())
-            .with_data(DOVECOT_CONF.as_bytes().to_vec(), "dovecot.conf")
-            .with_data(USERS.as_bytes().to_vec(), "users")
-            .with_data(MASTER_USERS.as_bytes().to_vec(), "master-users")
-            .with_data(ENTRYPOINT.as_bytes().to_vec(), "entrypoint.sh")
-            .build_image()
-            .await
-            .expect("build legacy image");
+        let image = ensure_image(
+            "proxy-legacymail",
+            DOCKERFILE,
+            &[
+                ("dovecot.conf", DOVECOT_CONF.as_bytes()),
+                ("users", USERS.as_bytes()),
+                ("master-users", MASTER_USERS.as_bytes()),
+                ("entrypoint.sh", ENTRYPOINT.as_bytes()),
+            ],
+        )
+        .await;
 
         let container = image
             .with_exposed_port(143u16.tcp())
@@ -239,6 +243,7 @@ impl Legacy {
             .with_exposed_port(25u16.tcp())
             .with_wait_for(WaitFor::message_on_stdout("LEGACY-MAIL READY"))
             .with_startup_timeout(Duration::from_secs(240))
+            .with_labels(owner_labels())
             .start()
             .await
             .expect("start legacy container");

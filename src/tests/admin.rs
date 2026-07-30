@@ -473,6 +473,10 @@ async fn admin_mapping_crud_and_reads() {
         body.contains("legacy") && body.contains("secondary"),
         "body: {body}"
     );
+    assert!(
+        body.contains("failure_sources") && body.contains("host_level_failure"),
+        "body: {body}"
+    );
 
     let (status, _) = admin_request(
         addr,

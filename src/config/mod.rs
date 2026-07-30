@@ -140,6 +140,8 @@ pub struct ServerConfig {
     pub backend_connect_retries: u32,
     #[serde(default = "default_host_down_threshold")]
     pub host_down_threshold: u32,
+    #[serde(default = "default_host_down_min_clients")]
+    pub host_down_min_clients: u32,
     #[serde(default = "default_host_down_cooldown", with = "duration")]
     pub host_down_cooldown: Duration,
     #[serde(default = "default_proxy_ttl")]
@@ -159,6 +161,7 @@ impl Default for ServerConfig {
             backend_timeout: DEFAULT_BACKEND_TIMEOUT,
             backend_connect_retries: DEFAULT_BACKEND_CONNECT_RETRIES,
             host_down_threshold: DEFAULT_HOST_DOWN_THRESHOLD,
+            host_down_min_clients: DEFAULT_HOST_DOWN_MIN_CLIENTS,
             host_down_cooldown: DEFAULT_HOST_DOWN_COOLDOWN,
             proxy_ttl: DEFAULT_PROXY_TTL,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
@@ -181,6 +184,7 @@ const DEFAULT_BRIDGE_IDLE: Duration = Duration::from_secs(1800);
 const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BACKEND_CONNECT_RETRIES: u32 = 1;
 const DEFAULT_HOST_DOWN_THRESHOLD: u32 = 5;
+const DEFAULT_HOST_DOWN_MIN_CLIENTS: u32 = 2;
 const DEFAULT_HOST_DOWN_COOLDOWN: Duration = Duration::from_secs(30);
 const DEFAULT_PROXY_TTL: u32 = 7;
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -199,6 +203,9 @@ fn default_backend_connect_retries() -> u32 {
 }
 fn default_host_down_threshold() -> u32 {
     DEFAULT_HOST_DOWN_THRESHOLD
+}
+fn default_host_down_min_clients() -> u32 {
+    DEFAULT_HOST_DOWN_MIN_CLIENTS
 }
 fn default_host_down_cooldown() -> Duration {
     DEFAULT_HOST_DOWN_COOLDOWN

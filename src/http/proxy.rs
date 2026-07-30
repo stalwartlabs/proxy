@@ -502,7 +502,7 @@ async fn serve(
         let _ = write_client(stream, &error_response(502, "Bad Gateway")).await;
         return Ok(Disposition::Close);
     }
-    let mut backend = match crate::proto::common::establish(ctx, &dest_id, || {
+    let mut backend = match crate::proto::common::establish(ctx, &dest_id, peer, || {
         crate::outbound::dial(dest, ep, fwd, &tls_cfg, peer, local)
     })
     .await

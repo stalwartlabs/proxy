@@ -76,6 +76,7 @@ pub async fn handle(
         ctx,
         &dest_id,
         stream,
+        peer,
         identifier.as_deref(),
         &residual,
         started,

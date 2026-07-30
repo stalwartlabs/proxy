@@ -82,6 +82,7 @@ pub async fn handle_submission(
         ctx,
         &dest_id,
         stream,
+        peer,
         identifier.as_deref(),
         &residual,
         started,
@@ -572,7 +573,7 @@ pub async fn handle_passthrough(
     let (dest, ep, tls_cfg) = ctx.endpoint(&dest_id, proto)?;
     let fwd = dest.forwarding_for(proto);
     forward::guard_loop(&ctx.self_binds, dest, ep, fwd, ctx.config.server.proxy_ttl)?;
-    let backend = common::establish(ctx, &dest_id, || {
+    let backend = common::establish(ctx, &dest_id, peer, || {
         outbound::dial(dest, ep, fwd, &tls_cfg, peer, local)
     })
     .await?;

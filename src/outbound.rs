@@ -134,7 +134,7 @@ pub async fn tls_connect(
     let tls = connector
         .connect(name, stream)
         .await
-        .map_err(|e| ProxyError::backend_connect(format!("backend TLS handshake failed: {e}")))?;
+        .map_err(|e| ProxyError::backend_session(format!("backend TLS handshake failed: {e}")))?;
     Ok(Box::new(tls))
 }
 
@@ -160,9 +160,9 @@ pub async fn read_line(
         let n = stream
             .read(&mut buf)
             .await
-            .map_err(|e| ProxyError::backend_connect(format!("reading backend: {e}")))?;
+            .map_err(|e| ProxyError::backend_session(format!("reading backend: {e}")))?;
         if n == 0 {
-            return Err(ProxyError::backend_connect(
+            return Err(ProxyError::backend_session(
                 "backend closed before sending a complete line",
             ));
         }

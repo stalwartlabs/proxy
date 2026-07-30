@@ -5,12 +5,16 @@
  */
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Once, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use testcontainers::runners::AsyncBuilder;
+use testcontainers::{GenericBuildableImage, GenericImage};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::net::acceptor::Listener;
@@ -34,9 +38,98 @@ pub mod toolbox_matrix;
 
 pub const HOST_GATEWAY: &str = "host.docker.internal";
 
+pub const OWNER_LABEL: &str = "art.stalw.proxy.test";
+
 pub fn pick_free_port() -> u16 {
     let l = StdTcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
+}
+
+fn run_id() -> &'static str {
+    static RUN_ID: OnceLock<String> = OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+pub fn owner_labels() -> [(&'static str, &'static str); 1] {
+    sweep_abandoned_containers();
+    [(OWNER_LABEL, run_id())]
+}
+
+fn docker_ids(filter: &str) -> Vec<String> {
+    Command::new("docker")
+        .args(["ps", "-aq", "--filter", filter])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sweep_abandoned_containers() {
+    static SWEPT: Once = Once::new();
+    SWEPT.call_once(|| {
+        let mine = docker_ids(&format!("label={OWNER_LABEL}={}", run_id()));
+        let stale: Vec<String> = docker_ids(&format!("label={OWNER_LABEL}"))
+            .into_iter()
+            .filter(|id| !mine.contains(id))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        eprintln!("removing {} abandoned test container(s)", stale.len());
+        let _ = Command::new("docker")
+            .args(["rm", "-f", "-v"])
+            .args(&stale)
+            .output();
+    });
+}
+
+fn content_tag(dockerfile: &str, data: &[(&str, &[u8])]) -> String {
+    let mut hasher = ahash::RandomState::with_seeds(0x5354, 0x414c, 0x5741, 0x5254).build_hasher();
+    dockerfile.hash(&mut hasher);
+    for (target, bytes) in data {
+        target.hash(&mut hasher);
+        bytes.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+async fn image_present(reference: &str) -> bool {
+    tokio::process::Command::new("docker")
+        .args(["image", "inspect", reference])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+pub async fn ensure_image(name: &str, dockerfile: &str, data: &[(&str, &[u8])]) -> GenericImage {
+    static BUILD_LOCK: Mutex<()> = Mutex::const_new(());
+    let tag = content_tag(dockerfile, data);
+    let _guard = BUILD_LOCK.lock().await;
+    if image_present(&format!("{name}:{tag}")).await {
+        return GenericImage::new(name.to_owned(), tag);
+    }
+    let mut builder =
+        GenericBuildableImage::new(name, &tag).with_dockerfile_string(dockerfile.to_string());
+    for (target, bytes) in data {
+        builder = builder.with_data(bytes.to_vec(), *target);
+    }
+    builder
+        .build_image()
+        .await
+        .unwrap_or_else(|e| panic!("build image {name}:{tag}: {e}"))
 }
 
 pub struct Proxy {
