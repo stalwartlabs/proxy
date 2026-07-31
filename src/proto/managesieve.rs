@@ -173,6 +173,7 @@ async fn preauth(
                                 ctx,
                                 &mut stream,
                                 plain_ok,
+                                common::sasl_offered(&caps.sasl, "LOGIN"),
                                 &req.tokens,
                                 &mut it,
                                 &mut auth_failures,
@@ -239,10 +240,12 @@ enum AuthStep {
     Close,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_authenticate(
     ctx: &Ctx,
     stream: &mut BoxedStream,
     plain_ok: bool,
+    login_offered: bool,
     tokens: &[crate::imap_receiver::Token],
     it: &mut std::slice::Iter<'_, u8>,
     auth_failures: &mut u32,
@@ -255,15 +258,20 @@ async fn handle_authenticate(
     let mech = Mechanism::parse(mech_tok.as_bytes());
     match mech {
         Mechanism::Plain | Mechanism::OAuthBearer | Mechanism::XOauth2 => {}
+        Mechanism::Login if login_offered => {}
         _ => return fail(stream, "Unsupported mechanism", auth_failures, max_attempts).await,
     }
-    if matches!(mech, Mechanism::Plain) && !plain_ok {
+    if matches!(mech, Mechanism::Plain | Mechanism::Login) && !plain_ok {
         write(
             &mut *stream,
             b"NO \"Cleartext authentication requires TLS\"\r\n",
         )
         .await?;
         return Ok(AuthStep::Continue);
+    }
+
+    if matches!(mech, Mechanism::Login) {
+        return authenticate_login(ctx, stream, tokens, it, auth_failures, max_attempts).await;
     }
 
     let (raw_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
@@ -288,6 +296,67 @@ async fn handle_authenticate(
         identifier,
         residual,
     })
+}
+
+async fn authenticate_login(
+    ctx: &Ctx,
+    stream: &mut BoxedStream,
+    tokens: &[crate::imap_receiver::Token],
+    it: &mut std::slice::Iter<'_, u8>,
+    auth_failures: &mut u32,
+    max_attempts: u32,
+) -> Result<AuthStep> {
+    let (user_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
+        (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+    } else {
+        write_challenge(stream, common::LOGIN_USERNAME_CHALLENGE).await?;
+        let seed = it.as_slice().to_vec();
+        read_sasl_response(stream, seed).await?
+    };
+    if common::sasl_cancelled(&user_b64) {
+        return fail(
+            stream,
+            "Authentication cancelled",
+            auth_failures,
+            max_attempts,
+        )
+        .await;
+    }
+
+    write_challenge(stream, common::LOGIN_PASSWORD_CHALLENGE).await?;
+    let (pass_b64, residual) = read_sasl_response(stream, residual).await?;
+    if common::sasl_cancelled(&pass_b64) {
+        return fail(
+            stream,
+            "Authentication cancelled",
+            auth_failures,
+            max_attempts,
+        )
+        .await;
+    }
+
+    let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
+        return fail(stream, "Invalid base64", auth_failures, max_attempts).await;
+    };
+    let Some(cred) = credential_from_sasl(&Mechanism::Plain, &raw) else {
+        return fail(stream, "Malformed credentials", auth_failures, max_attempts).await;
+    };
+    let identifier = identifier_from_credential(&cred, &ctx.config.oauth.jwt_username_claim);
+
+    Ok(AuthStep::Done {
+        mech: Mechanism::Plain,
+        raw_challenge: raw,
+        identifier,
+        residual,
+    })
+}
+
+async fn write_challenge(stream: &mut BoxedStream, challenge: &str) -> Result<()> {
+    write(
+        &mut *stream,
+        format!("{{{}}}\r\n{challenge}\r\n", challenge.len()).as_bytes(),
+    )
+    .await
 }
 
 async fn fail(
@@ -325,7 +394,15 @@ async fn read_sasl_response(stream: &mut BoxedStream, seed: Vec<u8>) -> Result<(
         }
         Ok((data, rest))
     } else {
-        Ok((line, residual))
+        Ok((unquote(line), residual))
+    }
+}
+
+fn unquote(line: Vec<u8>) -> Vec<u8> {
+    if line.len() >= 2 && line.first() == Some(&b'"') && line.last() == Some(&b'"') {
+        line[1..line.len() - 1].to_vec()
+    } else {
+        line
     }
 }
 

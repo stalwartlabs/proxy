@@ -315,3 +315,224 @@ async fn smtp_passthrough_bridges_raw() {
     let _ = backend.await;
     handler.abort();
 }
+
+fn submission_config_with_sasl(port: u16, mapping_path: &str, plain: bool, sasl: &str) -> String {
+    format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{mapping_path}"
+
+[capabilities.submission]
+allow_plain_auth_without_tls = {plain}
+sasl = {sasl}
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.submission]
+port = {port}
+tls = "plain"
+
+[listener.submission]
+protocol = "submission"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#
+    )
+}
+
+async fn spawn_submission(
+    ctx: &std::sync::Arc<crate::proto::common::Ctx>,
+    peer: &str,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+    let listener = ctx.config.listener["submission"].clone();
+    let (client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let peer = peer.to_string();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::smtp::handle_submission(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            peer.parse().unwrap(),
+            "127.0.0.1:587".parse().unwrap(),
+        )
+        .await;
+    });
+    (client, handler)
+}
+
+#[tokio::test]
+async fn submission_advertises_and_completes_auth_login() {
+    let (port, backend) = dummy_backend(|sock| submission_backend(sock, "user@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = submission_config(port, &mapping.path().display().to_string(), true);
+    let ctx = make_ctx(&toml).await;
+
+    let (mut client, handler) = spawn_submission(&ctx, "127.0.0.1:40030").await;
+
+    let greeting = read_line(&mut client).await;
+    assert!(greeting.starts_with("220"), "greeting: {greeting}");
+
+    send(&mut client, b"EHLO test.local\r\n").await;
+    let ehlo = read_until(&mut client, b"250 ").await;
+    let ehlo = String::from_utf8_lossy(&ehlo).into_owned();
+    assert!(
+        ehlo.contains("AUTH ") && ehlo.to_uppercase().contains("LOGIN"),
+        "EHLO must advertise AUTH LOGIN, got {ehlo}"
+    );
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let user_prompt = read_line(&mut client).await;
+    assert_eq!(user_prompt.trim_end(), "334 VXNlcm5hbWU6", "{user_prompt}");
+
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("user@example.com")).as_bytes(),
+    )
+    .await;
+    let pass_prompt = read_line(&mut client).await;
+    assert_eq!(pass_prompt.trim_end(), "334 UGFzc3dvcmQ6", "{pass_prompt}");
+
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"235").is_some(),
+        "expected 235, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn submission_auth_login_accepts_username_as_initial_response() {
+    let (port, backend) = dummy_backend(|sock| submission_backend(sock, "user@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = submission_config(port, &mapping.path().display().to_string(), true);
+    let ctx = make_ctx(&toml).await;
+
+    let (mut client, handler) = spawn_submission(&ctx, "127.0.0.1:40031").await;
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"EHLO test.local\r\n").await;
+    let _ehlo = read_until(&mut client, b"250 ").await;
+
+    send(
+        &mut client,
+        format!("AUTH LOGIN {}\r\n", BASE64.encode("user@example.com")).as_bytes(),
+    )
+    .await;
+    let pass_prompt = read_line(&mut client).await;
+    assert_eq!(pass_prompt.trim_end(), "334 UGFzc3dvcmQ6", "{pass_prompt}");
+
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"235").is_some(),
+        "expected 235, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn submission_auth_login_cancelled_by_client() {
+    let mapping = mapping_file("");
+    let toml = submission_config(1, &mapping.path().display().to_string(), true);
+    let ctx = make_ctx(&toml).await;
+
+    let (mut client, handler) = spawn_submission(&ctx, "127.0.0.1:40032").await;
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"EHLO test.local\r\n").await;
+    let _ehlo = read_until(&mut client, b"250 ").await;
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let _user_prompt = read_line(&mut client).await;
+    send(&mut client, b"*\r\n").await;
+
+    let resp = read_until(&mut client, b"\r\n").await;
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.starts_with("501"), "expected 501 cancel, got {resp}");
+
+    send(&mut client, b"NOOP\r\n").await;
+    let noop = read_line(&mut client).await;
+    assert!(
+        noop.starts_with("250"),
+        "session must survive a cancelled AUTH, got {noop}"
+    );
+    handler.abort();
+}
+
+#[tokio::test]
+async fn submission_auth_login_refused_when_cleartext_is_not_allowed() {
+    let mapping = mapping_file("");
+    let toml = submission_config(1, &mapping.path().display().to_string(), false);
+    let ctx = make_ctx(&toml).await;
+
+    let (mut client, handler) = spawn_submission(&ctx, "127.0.0.1:40033").await;
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"EHLO test.local\r\n").await;
+    let ehlo = read_until(&mut client, b"250 ").await;
+    let ehlo = String::from_utf8_lossy(&ehlo).into_owned();
+    assert!(
+        !ehlo.to_uppercase().contains("LOGIN"),
+        "LOGIN must not be advertised without TLS, got {ehlo}"
+    );
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let resp = read_until(&mut client, b"\r\n").await;
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.starts_with("538"), "expected 538, got {resp}");
+    handler.abort();
+}
+
+#[tokio::test]
+async fn submission_auth_login_rejected_when_not_configured() {
+    let mapping = mapping_file("");
+    let toml = submission_config_with_sasl(
+        1,
+        &mapping.path().display().to_string(),
+        true,
+        r#"["PLAIN", "OAUTHBEARER", "XOAUTH2"]"#,
+    );
+    let ctx = make_ctx(&toml).await;
+
+    let (mut client, handler) = spawn_submission(&ctx, "127.0.0.1:40034").await;
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"EHLO test.local\r\n").await;
+    let ehlo = read_until(&mut client, b"250 ").await;
+    let ehlo = String::from_utf8_lossy(&ehlo).into_owned();
+    assert!(
+        !ehlo.to_uppercase().contains("LOGIN"),
+        "LOGIN must not be advertised when unconfigured, got {ehlo}"
+    );
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let resp = read_until(&mut client, b"\r\n").await;
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(
+        resp.starts_with("535") && resp.contains("Unsupported"),
+        "expected 535 unsupported, got {resp}"
+    );
+    handler.abort();
+}

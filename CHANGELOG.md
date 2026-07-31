@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.2] - 2026-07-31
+
+### Added
+- `AUTH LOGIN` support on IMAP, POP3, ManageSieve and SMTP submission (#3).
+
+### Changed
+- `LOGIN` is now part of the default `capabilities.<protocol>.sasl` set.
+
+### Fixed
+
 ## [1.0.1] - 2026-07-30
 
 ### Added

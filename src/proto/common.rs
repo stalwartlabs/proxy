@@ -94,12 +94,37 @@ pub fn build_greetings(config: &Config) -> Greetings {
     }
 }
 
+pub const LOGIN_USERNAME_CHALLENGE: &str = "VXNlcm5hbWU6";
+pub const LOGIN_PASSWORD_CHALLENGE: &str = "UGFzc3dvcmQ6";
+
+pub fn is_cleartext_mechanism(mech: &str) -> bool {
+    mech.eq_ignore_ascii_case("PLAIN") || mech.eq_ignore_ascii_case("LOGIN")
+}
+
 pub fn advertised_sasl(sasl: &[String], plain_ok: bool) -> Vec<&str> {
     sasl.iter()
-        .filter(|m| !m.eq_ignore_ascii_case("LOGIN"))
-        .filter(|m| plain_ok || !m.eq_ignore_ascii_case("PLAIN"))
+        .filter(|m| plain_ok || !is_cleartext_mechanism(m))
         .map(|s| s.as_str())
         .collect()
+}
+
+pub fn sasl_offered(sasl: &[String], mech: &str) -> bool {
+    sasl.iter().any(|m| m.eq_ignore_ascii_case(mech))
+}
+
+pub fn sasl_cancelled(response: &[u8]) -> bool {
+    response.trim_ascii() == b"*"
+}
+
+pub fn login_challenge(username_b64: &[u8], password_b64: &[u8]) -> Option<Vec<u8>> {
+    let username = crate::sasl::decode_sasl_ir(username_b64)?;
+    let password = crate::sasl::decode_sasl_ir(password_b64)?;
+    let mut raw = Vec::with_capacity(username.len() + password.len() + 2);
+    raw.push(0);
+    raw.extend_from_slice(&username);
+    raw.push(0);
+    raw.extend_from_slice(&password);
+    Some(raw)
 }
 
 pub fn advertises_token(haystack: &[u8], token: &str) -> bool {
@@ -902,6 +927,61 @@ mod tests {
         assert!(advertises_token(imap, "IMAP4rev2"));
         let pop3 = b"+OK ready [XCLIENT]\r\n";
         assert!(advertises_token(pop3, "XCLIENT"));
+    }
+
+    fn sasl_list(mechs: &[&str]) -> Vec<String> {
+        mechs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn advertised_sasl_keeps_login_when_cleartext_is_allowed() {
+        let sasl = sasl_list(&["PLAIN", "LOGIN", "OAUTHBEARER", "XOAUTH2"]);
+        assert_eq!(
+            advertised_sasl(&sasl, true),
+            vec!["PLAIN", "LOGIN", "OAUTHBEARER", "XOAUTH2"]
+        );
+    }
+
+    #[test]
+    fn advertised_sasl_drops_login_with_plain_when_cleartext_is_refused() {
+        let sasl = sasl_list(&["PLAIN", "LOGIN", "OAUTHBEARER", "XOAUTH2"]);
+        assert_eq!(
+            advertised_sasl(&sasl, false),
+            vec!["OAUTHBEARER", "XOAUTH2"]
+        );
+    }
+
+    #[test]
+    fn advertised_sasl_omits_login_when_not_configured() {
+        let sasl = sasl_list(&["PLAIN", "OAUTHBEARER"]);
+        assert_eq!(advertised_sasl(&sasl, true), vec!["PLAIN", "OAUTHBEARER"]);
+        assert!(!sasl_offered(&sasl, "LOGIN"));
+        assert!(sasl_offered(&sasl, "plain"));
+    }
+
+    #[test]
+    fn login_challenge_builds_a_plain_authentication_frame() {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let user = BASE64.encode("user@example.com");
+        let pass = BASE64.encode("secret");
+        assert_eq!(
+            login_challenge(user.as_bytes(), pass.as_bytes()).unwrap(),
+            b"\0user@example.com\0secret".to_vec()
+        );
+    }
+
+    #[test]
+    fn login_challenge_rejects_invalid_base64() {
+        assert!(login_challenge(b"!!!!", b"c2VjcmV0").is_none());
+        assert!(login_challenge(b"dXNlcg==", b"!!!!").is_none());
+    }
+
+    #[test]
+    fn sasl_cancellation_is_a_bare_asterisk() {
+        assert!(sasl_cancelled(b"*"));
+        assert!(sasl_cancelled(b"*\r"));
+        assert!(!sasl_cancelled(b"KiA="));
+        assert!(!sasl_cancelled(b""));
     }
 
     #[test]

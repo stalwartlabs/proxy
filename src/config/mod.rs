@@ -496,7 +496,8 @@ const DEFAULT_IMAP_ADVERTISE: &[&str] = &[
     "UTF8=ACCEPT",
     "JMAPACCESS",
 ];
-const DEFAULT_SASL: &[&str] = &["PLAIN", "OAUTHBEARER", "XOAUTH2"];
+const DEFAULT_SASL: &[&str] = &["PLAIN", "LOGIN", "OAUTHBEARER", "XOAUTH2"];
+pub const SUPPORTED_SASL: &[&str] = &["PLAIN", "LOGIN", "OAUTHBEARER", "XOAUTH2"];
 const DEFAULT_IMAP_BANNER: &str = "Stalwart IMAP4rev2 at your service.";
 
 fn default_imap_advertise() -> Vec<String> {
@@ -510,6 +511,30 @@ fn default_sasl() -> Vec<String> {
 }
 fn default_imap_banner() -> String {
     DEFAULT_IMAP_BANNER.to_string()
+}
+
+fn canonicalize_sasl_list(list: &mut [String], section: &str) -> Result<()> {
+    let mut seen: Vec<&'static str> = Vec::with_capacity(list.len());
+    for entry in list.iter_mut() {
+        let Some(canonical) = SUPPORTED_SASL
+            .iter()
+            .find(|m| m.eq_ignore_ascii_case(entry))
+            .copied()
+        else {
+            return Err(ProxyError::config(format!(
+                "capabilities.{section}.sasl lists unsupported mechanism {entry:?}; supported mechanisms are {}",
+                SUPPORTED_SASL.join(", ")
+            )));
+        };
+        if seen.contains(&canonical) {
+            return Err(ProxyError::config(format!(
+                "capabilities.{section}.sasl lists mechanism {canonical} more than once"
+            )));
+        }
+        seen.push(canonical);
+        *entry = canonical.to_string();
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,10 +821,19 @@ fn default_lockout_duration() -> Duration {
 
 impl Config {
     pub fn parse_and_validate(raw: &str) -> Result<Self> {
-        let config: Config =
+        let mut config: Config =
             toml::from_str(raw).map_err(|e| ProxyError::config(format!("TOML parse: {e}")))?;
+        config.canonicalize_sasl()?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn canonicalize_sasl(&mut self) -> Result<()> {
+        let caps = &mut self.capabilities;
+        canonicalize_sasl_list(&mut caps.imap.sasl, "imap")?;
+        canonicalize_sasl_list(&mut caps.managesieve.sasl, "managesieve")?;
+        canonicalize_sasl_list(&mut caps.submission.sasl, "submission")?;
+        canonicalize_sasl_list(&mut caps.pop3.sasl, "pop3")
     }
 
     fn destination(&self, id: &str) -> Result<&DestinationConfig> {

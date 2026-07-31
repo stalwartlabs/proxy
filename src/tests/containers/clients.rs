@@ -161,6 +161,68 @@ pub async fn submission_send(
     }
 }
 
+async fn submission_auth_login<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    login: &str,
+    password: &str,
+) -> String {
+    stream.write_all(b"EHLO proxy.test\r\n").await.unwrap();
+    let ehlo = read_until(stream, "250 ").await;
+    assert!(
+        ehlo.to_uppercase().contains("LOGIN"),
+        "submission must advertise AUTH LOGIN: {ehlo:?}"
+    );
+
+    stream.write_all(b"AUTH LOGIN\r\n").await.unwrap();
+    let user_prompt = read_until(stream, "334 ").await;
+    assert!(
+        user_prompt.contains("VXNlcm5hbWU6"),
+        "expected a username challenge: {user_prompt:?}"
+    );
+    stream
+        .write_all(format!("{}\r\n", B64.encode(login)).as_bytes())
+        .await
+        .unwrap();
+
+    let pass_prompt = read_until(stream, "334 ").await;
+    assert!(
+        pass_prompt.contains("UGFzc3dvcmQ6"),
+        "expected a password challenge: {pass_prompt:?}"
+    );
+    stream
+        .write_all(format!("{}\r\n", B64.encode(password)).as_bytes())
+        .await
+        .unwrap();
+    read_reply(stream).await
+}
+
+pub async fn submission_send_auth_login(
+    host: &str,
+    port: u16,
+    tls: Tls,
+    login: &str,
+    password: &str,
+) -> String {
+    match tls {
+        Tls::Implicit => {
+            let tcp = TcpStream::connect((host, port)).await.unwrap();
+            let mut s = tls_connect_client(tcp).await;
+            let _ = read_reply(&mut s).await;
+            submission_auth_login(&mut s, login, password).await
+        }
+        Tls::Starttls => {
+            let mut tcp = TcpStream::connect((host, port)).await.unwrap();
+            let _ = read_reply(&mut tcp).await;
+            tcp.write_all(b"EHLO proxy.test\r\n").await.unwrap();
+            let _ = read_until(&mut tcp, "250 ").await;
+            tcp.write_all(b"STARTTLS\r\n").await.unwrap();
+            let _ = read_reply(&mut tcp).await;
+            let mut s = tls_connect_client(tcp).await;
+            submission_auth_login(&mut s, login, password).await
+        }
+    }
+}
+
 pub async fn smtp_passthrough_send(host: &str, port: u16, from: &str, to: &str) -> String {
     let mut s = TcpStream::connect((host, port)).await.unwrap();
     let _ = read_reply(&mut s).await;

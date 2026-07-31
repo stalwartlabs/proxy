@@ -7,7 +7,9 @@
 use std::net::SocketAddr;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use smtp_proto::{AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2, Error as SmtpError, Request};
+use smtp_proto::{
+    AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2, Error as SmtpError, Request,
+};
 use tokio::time::timeout;
 
 use crate::config::{Forwarding, ListenerConfig, Protocol, SubmissionCapabilities, TlsMode};
@@ -181,6 +183,7 @@ async fn preauth(
                         let params = AuthParams {
                             ctx,
                             plain_ok,
+                            login_offered: common::sasl_offered(&caps.sasl, "LOGIN"),
                             ehlo_host: &ehlo_host,
                             max_attempts: listener.max_auth_attempts,
                         };
@@ -260,6 +263,7 @@ enum AuthStep {
 struct AuthParams<'a> {
     ctx: &'a Ctx,
     plain_ok: bool,
+    login_offered: bool,
     ehlo_host: &'a str,
     max_attempts: u32,
 }
@@ -275,7 +279,11 @@ async fn handle_auth(
 ) -> Result<AuthStep> {
     let max_attempts = params.max_attempts;
 
-    let Some(mech) = mech_from_flag(mechanism) else {
+    let mech = match mech_from_flag(mechanism) {
+        Some(Mechanism::Login) if !params.login_offered => None,
+        other => other,
+    };
+    let Some(mech) = mech else {
         return fail(
             stream,
             buf,
@@ -286,7 +294,7 @@ async fn handle_auth(
         )
         .await;
     };
-    if matches!(mech, Mechanism::Plain) && !params.plain_ok {
+    if matches!(mech, Mechanism::Plain | Mechanism::Login) && !params.plain_ok {
         write(
             &mut *stream,
             b"538 5.7.11 Encryption required for requested authentication mechanism\r\n",
@@ -294,6 +302,18 @@ async fn handle_auth(
         .await?;
         buf.drain(..consumed);
         return Ok(AuthStep::Continue);
+    }
+
+    if matches!(mech, Mechanism::Login) {
+        return handle_auth_login(
+            params,
+            stream,
+            buf,
+            consumed,
+            initial_response,
+            auth_failures,
+        )
+        .await;
     }
 
     let raw_b64: Vec<u8> = if !initial_response.is_empty() {
@@ -343,6 +363,96 @@ async fn handle_auth(
     })
 }
 
+async fn handle_auth_login(
+    params: &AuthParams<'_>,
+    stream: &mut BoxedStream,
+    buf: &mut Vec<u8>,
+    consumed: usize,
+    initial_response: &str,
+    auth_failures: &mut u32,
+) -> Result<AuthStep> {
+    let max_attempts = params.max_attempts;
+
+    let user_b64: Vec<u8> = if !initial_response.is_empty() {
+        let ir = initial_response.as_bytes().to_vec();
+        buf.drain(..consumed);
+        ir
+    } else {
+        write(
+            &mut *stream,
+            format!("334 {}\r\n", common::LOGIN_USERNAME_CHALLENGE).as_bytes(),
+        )
+        .await?;
+        buf.drain(..consumed);
+        let seed = std::mem::take(buf);
+        let (line, rest) = common::read_crlf_line(stream, seed, MAX_PREAUTH).await?;
+        *buf = rest;
+        line
+    };
+    if common::sasl_cancelled(&user_b64) {
+        return cancelled(stream, auth_failures, max_attempts).await;
+    }
+
+    write(
+        &mut *stream,
+        format!("334 {}\r\n", common::LOGIN_PASSWORD_CHALLENGE).as_bytes(),
+    )
+    .await?;
+    let seed = std::mem::take(buf);
+    let (pass_b64, rest) = common::read_crlf_line(stream, seed, MAX_PREAUTH).await?;
+    *buf = rest;
+    if common::sasl_cancelled(&pass_b64) {
+        return cancelled(stream, auth_failures, max_attempts).await;
+    }
+
+    let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
+        return fail(
+            stream,
+            buf,
+            0,
+            "5.7.8 Invalid base64",
+            auth_failures,
+            max_attempts,
+        )
+        .await;
+    };
+    let Some(cred) = credential_from_sasl(&Mechanism::Plain, &raw) else {
+        return fail(
+            stream,
+            buf,
+            0,
+            "5.7.8 Malformed credentials",
+            auth_failures,
+            max_attempts,
+        )
+        .await;
+    };
+    let identifier = identifier_from_credential(&cred, &params.ctx.config.oauth.jwt_username_claim);
+    let residual = std::mem::take(buf);
+
+    Ok(AuthStep::Done {
+        mech: Mechanism::Plain,
+        raw_challenge: raw,
+        identifier,
+        residual,
+        ehlo_host: params.ehlo_host.to_string(),
+    })
+}
+
+async fn cancelled(
+    stream: &mut BoxedStream,
+    auth_failures: &mut u32,
+    max_attempts: u32,
+) -> Result<AuthStep> {
+    write(&mut *stream, b"501 5.7.0 Authentication cancelled\r\n").await?;
+    *auth_failures += 1;
+    if *auth_failures >= max_attempts {
+        Ok(AuthStep::Close)
+    } else {
+        Ok(AuthStep::Continue)
+    }
+}
+
 async fn fail(
     stream: &mut BoxedStream,
     buf: &mut Vec<u8>,
@@ -370,6 +480,8 @@ fn mech_from_flag(flag: u64) -> Option<Mechanism> {
         Some(Mechanism::OAuthBearer)
     } else if flag & AUTH_XOAUTH2 != 0 {
         Some(Mechanism::XOauth2)
+    } else if flag & AUTH_LOGIN != 0 {
+        Some(Mechanism::Login)
     } else {
         None
     }

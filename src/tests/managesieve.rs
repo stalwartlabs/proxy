@@ -306,3 +306,133 @@ tls = "plain"
     );
     handler.abort();
 }
+
+#[tokio::test]
+async fn managesieve_authenticate_login_replays_as_plain() {
+    let (port, backend) = dummy_backend(|sock| backend_expect_auth(sock, "user@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["managesieve"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::managesieve::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40014".parse().unwrap(),
+            "127.0.0.1:4190".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_until(&mut client, b"OK ").await;
+    let greeting = String::from_utf8_lossy(&greeting).into_owned();
+    assert!(
+        greeting.contains("LOGIN"),
+        "greeting must advertise SASL LOGIN, got {greeting}"
+    );
+
+    send(&mut client, b"AUTHENTICATE \"LOGIN\"\r\n").await;
+    let user_prompt = read_until(&mut client, b"VXNlcm5hbWU6\r\n").await;
+    assert!(
+        find(&user_prompt, b"{12}\r\nVXNlcm5hbWU6").is_some(),
+        "expected a username challenge literal, got {:?}",
+        String::from_utf8_lossy(&user_prompt)
+    );
+
+    send(
+        &mut client,
+        format!("\"{}\"\r\n", BASE64.encode("user@example.com")).as_bytes(),
+    )
+    .await;
+    let pass_prompt = read_until(&mut client, b"UGFzc3dvcmQ6\r\n").await;
+    assert!(
+        find(&pass_prompt, b"{12}\r\nUGFzc3dvcmQ6").is_some(),
+        "expected a password challenge literal, got {:?}",
+        String::from_utf8_lossy(&pass_prompt)
+    );
+
+    send(
+        &mut client,
+        format!("\"{}\"\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"OK \"authenticated\"").is_some(),
+        "expected OK authenticated, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn managesieve_authenticate_login_rejected_when_not_configured() {
+    let mapping = mapping_file("");
+    let toml = format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[capabilities.managesieve]
+allow_plain_auth_without_tls = true
+sasl = ["PLAIN", "OAUTHBEARER"]
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.managesieve]
+port = 1
+tls = "plain"
+
+[listener.managesieve]
+protocol = "managesieve"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#,
+        mapping.path().display()
+    );
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["managesieve"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::managesieve::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40015".parse().unwrap(),
+            "127.0.0.1:4190".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_until(&mut client, b"OK ").await;
+    let greeting = String::from_utf8_lossy(&greeting).into_owned();
+    assert!(
+        !greeting.to_uppercase().contains("LOGIN"),
+        "LOGIN must not be advertised when unconfigured, got {greeting}"
+    );
+
+    send(&mut client, b"AUTHENTICATE \"LOGIN\"\r\n").await;
+    let resp = read_until(&mut client, b"\r\n").await;
+    assert!(
+        find(&resp, b"NO \"Unsupported mechanism\"").is_some(),
+        "expected an unsupported-mechanism NO, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    handler.abort();
+}

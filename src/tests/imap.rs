@@ -446,3 +446,209 @@ tls = "starttls"
     );
     handler.abort();
 }
+
+#[tokio::test]
+async fn imap_authenticate_login_replays_as_plain() {
+    let (port, backend) = dummy_backend(|sock| backend_expect_auth(sock, "user@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40060".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_line(&mut client).await;
+    assert!(
+        greeting.contains("AUTH=LOGIN"),
+        "capability must advertise AUTH=LOGIN, got {greeting}"
+    );
+
+    send(&mut client, b"a1 AUTHENTICATE LOGIN\r\n").await;
+    let user_prompt = read_line(&mut client).await;
+    assert_eq!(user_prompt.trim_end(), "+ VXNlcm5hbWU6", "{user_prompt}");
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("user@example.com")).as_bytes(),
+    )
+    .await;
+
+    let pass_prompt = read_line(&mut client).await;
+    assert_eq!(pass_prompt.trim_end(), "+ UGFzc3dvcmQ6", "{pass_prompt}");
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    send(&mut client, b"a2 NOOP\r\n").await;
+    let resp = read_to_eof(&mut client).await;
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.contains("a1 OK"), "expected a1 OK, got {resp}");
+    assert!(resp.contains("a2 OK"), "expected bridged a2 OK, got {resp}");
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn imap_authenticate_login_accepts_username_as_initial_response() {
+    let (port, backend) =
+        dummy_backend(|sock| backend_expect_auth(sock, "alice@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40061".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _greeting = read_line(&mut client).await;
+    send(
+        &mut client,
+        format!(
+            "a1 AUTHENTICATE LOGIN {}\r\n",
+            BASE64.encode("alice@example.com")
+        )
+        .as_bytes(),
+    )
+    .await;
+    let pass_prompt = read_line(&mut client).await;
+    assert_eq!(pass_prompt.trim_end(), "+ UGFzc3dvcmQ6", "{pass_prompt}");
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+    send(&mut client, b"a2 NOOP\r\n").await;
+
+    let resp = read_until(&mut client, b"a1 OK").await;
+    assert!(find(&resp, b"a1 OK").is_some());
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn imap_authenticate_login_cancelled_by_client() {
+    let mapping = mapping_file("");
+    let toml = config(1, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40062".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"a1 AUTHENTICATE LOGIN\r\n").await;
+    let _user_prompt = read_line(&mut client).await;
+    send(&mut client, b"*\r\n").await;
+
+    let resp = read_until(&mut client, b"a1 NO").await;
+    assert!(
+        find(&resp, b"a1 NO").is_some(),
+        "expected tagged NO, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    send(&mut client, b"a2 CAPABILITY\r\n").await;
+    let resp = read_until(&mut client, b"a2 OK").await;
+    assert!(
+        find(&resp, b"a2 OK").is_some(),
+        "session must survive a cancelled AUTHENTICATE, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    handler.abort();
+}
+
+#[tokio::test]
+async fn imap_authenticate_login_refused_without_tls_when_plain_disabled() {
+    let mapping = mapping_file("");
+    let toml = format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[capabilities.imap]
+allow_plain_auth_without_tls = false
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+tls_server_name = "backend.example.com"
+[destination.legacy.protocol.imap]
+port = 1
+tls = "implicit"
+
+[listener.imap]
+protocol = "imap"
+bind = ["127.0.0.1:0"]
+tls = "starttls"
+"#,
+        mapping.path().display()
+    );
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40063".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_line(&mut client).await;
+    assert!(
+        !greeting.contains("AUTH=LOGIN"),
+        "AUTH=LOGIN must not be advertised without TLS, got {greeting}"
+    );
+
+    send(&mut client, b"a1 AUTHENTICATE LOGIN\r\n").await;
+    let resp = read_until(&mut client, b"a1 NO").await;
+    assert!(
+        find(&resp, b"PRIVACYREQUIRED").is_some(),
+        "expected PRIVACYREQUIRED, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    handler.abort();
+}

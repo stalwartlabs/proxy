@@ -396,3 +396,216 @@ tls = "plain"
     );
     handler.abort();
 }
+
+#[tokio::test]
+async fn pop3_auth_login_replays_as_plain() {
+    let (port, backend) = dummy_backend(|sock| backend_expect_auth(sock, "user@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let mut client = spawn_pop3(&ctx).await;
+
+    let _greeting = read_line(&mut client).await;
+
+    send(&mut client, b"CAPA\r\n").await;
+    let capa = read_until(&mut client, b".\r\n").await;
+    let capa = String::from_utf8_lossy(&capa).into_owned();
+    assert!(
+        capa.contains("LOGIN"),
+        "CAPA must advertise SASL LOGIN, got {capa}"
+    );
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let user_prompt = read_until(&mut client, b"\r\n").await;
+    assert_eq!(
+        String::from_utf8_lossy(&user_prompt).trim_end(),
+        "+ VXNlcm5hbWU6"
+    );
+    send(
+        &mut client,
+        format!("{}\r\n", BASE64.encode("user@example.com")).as_bytes(),
+    )
+    .await;
+
+    let pass_prompt = read_until(&mut client, b"\r\n").await;
+    assert_eq!(
+        String::from_utf8_lossy(&pass_prompt).trim_end(),
+        "+ UGFzc3dvcmQ6"
+    );
+    send(
+        &mut client,
+        format!("{}\r\nSTAT\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"+OK logged in").is_some(),
+        "expected +OK logged in, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        find(&resp, b"+OK 0 0").is_some(),
+        "expected bridged STAT reply, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = backend.await;
+}
+
+#[tokio::test]
+async fn pop3_auth_login_accepts_username_as_initial_response() {
+    let (port, backend) =
+        dummy_backend(|sock| backend_expect_auth(sock, "alice@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let mut client = spawn_pop3(&ctx).await;
+
+    let _greeting = read_line(&mut client).await;
+    send(
+        &mut client,
+        format!("AUTH LOGIN {}\r\n", BASE64.encode("alice@example.com")).as_bytes(),
+    )
+    .await;
+    let pass_prompt = read_until(&mut client, b"\r\n").await;
+    assert_eq!(
+        String::from_utf8_lossy(&pass_prompt).trim_end(),
+        "+ UGFzc3dvcmQ6"
+    );
+    send(
+        &mut client,
+        format!("{}\r\nSTAT\r\n", BASE64.encode("secret")).as_bytes(),
+    )
+    .await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"+OK logged in").is_some(),
+        "expected +OK logged in, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = backend.await;
+}
+
+#[tokio::test]
+async fn pop3_auth_login_cancelled_by_client() {
+    let mapping = mapping_file("");
+    let toml = config(1, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let mut client = spawn_pop3(&ctx).await;
+
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let _user_prompt = read_until(&mut client, b"\r\n").await;
+    send(&mut client, b"*\r\nQUIT\r\n").await;
+
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        find(&resp, b"-ERR authentication cancelled").is_some(),
+        "expected a cancel error, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        find(&resp, b"+OK Bye").is_some(),
+        "session must survive a cancelled AUTH, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
+#[tokio::test]
+async fn pop3_auth_login_refused_without_tls_when_plain_disabled() {
+    let mapping = mapping_file("");
+    let toml = format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[capabilities.pop3]
+allow_plain_auth_without_tls = false
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+tls_server_name = "backend.example.com"
+[destination.legacy.protocol.pop3]
+port = 1
+tls = "implicit"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#,
+        mapping.path().display()
+    );
+    let ctx = make_ctx(&toml).await;
+    let mut client = spawn_pop3(&ctx).await;
+
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"CAPA\r\n").await;
+    let capa = read_until(&mut client, b".\r\n").await;
+    let capa = String::from_utf8_lossy(&capa).into_owned();
+    assert!(
+        !capa.to_uppercase().contains("LOGIN"),
+        "CAPA must omit LOGIN without TLS, got {capa}"
+    );
+
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let resp = read_until(&mut client, b"-ERR").await;
+    assert!(
+        find(&resp, b"cleartext authentication requires TLS").is_some(),
+        "expected a cleartext refusal, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}
+
+#[tokio::test]
+async fn pop3_auth_login_rejected_when_not_configured() {
+    let mapping = mapping_file("");
+    let toml = format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[capabilities.pop3]
+allow_plain_auth_without_tls = true
+sasl = ["PLAIN", "OAUTHBEARER"]
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.pop3]
+port = 1
+tls = "plain"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#,
+        mapping.path().display()
+    );
+    let ctx = make_ctx(&toml).await;
+    let mut client = spawn_pop3(&ctx).await;
+
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, b"AUTH LOGIN\r\n").await;
+    let resp = read_until(&mut client, b"-ERR").await;
+    assert!(
+        find(&resp, b"unsupported mechanism").is_some(),
+        "expected an unsupported-mechanism error, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}

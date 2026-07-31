@@ -191,8 +191,13 @@ async fn handle(
         match request.method.as_str() {
             "GET" => write_response(&mut stream, 200, "OK", "ok\n").await?,
             _ => {
-                write_response(&mut stream, 405, "Method Not Allowed", "method not allowed\n")
-                    .await?
+                write_response(
+                    &mut stream,
+                    405,
+                    "Method Not Allowed",
+                    "method not allowed\n",
+                )
+                .await?
             }
         }
         return Ok(());
@@ -653,8 +658,8 @@ mod tests {
     fn parse_trims_trailing_slash() {
         let req = parse_request(b"GET /stats/ HTTP/1.1\r\nHost: x\r\n").unwrap();
         assert_eq!(req.path, "/stats");
-        let req = parse_request(b"GET /cache/invalidate/?identifier=a HTTP/1.1\r\nHost: x\r\n")
-            .unwrap();
+        let req =
+            parse_request(b"GET /cache/invalidate/?identifier=a HTTP/1.1\r\nHost: x\r\n").unwrap();
         assert_eq!(req.path, "/cache/invalidate");
         assert_eq!(req.query_param("identifier").as_deref(), Some("a"));
         let req = parse_request(b"GET / HTTP/1.1\r\nHost: x\r\n").unwrap();

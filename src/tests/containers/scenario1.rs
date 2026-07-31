@@ -240,3 +240,48 @@ tls = "plain"
         "passthrough RCPT to a hosted Stalwart user should be accepted: {reply:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn scenario1_submission_auth_login_reaches_both_backends() {
+    let legacy = Legacy::start().await;
+    let stalwart =
+        Stalwart::start_proxied(Edition::New, "new.test", &[("carol", "CarolPass#2026")]).await;
+
+    let legacy_user = ("alice@legacy.test", "AlicePass#2026");
+    let stalwart_user = ("carol@new.test", "CarolPass#2026");
+    let map = mapping_file(&format!(
+        "{}\tlegacy\n{}\tstalwartnew\n",
+        legacy_user.0, stalwart_user.0
+    ));
+
+    let mode = Tls::Implicit;
+    let listen = pick_free_port();
+    let toml = build_config(
+        "submission",
+        mode,
+        listen,
+        legacy_endpoint(&legacy, "submission", mode),
+        stalwart_endpoint(&stalwart, "submission", mode),
+        map.path().to_str().unwrap(),
+    );
+    let proxy = Proxy::launch(&toml).await;
+    let port = proxy.port("l");
+
+    for (who, (login, password)) in [("legacy", legacy_user), ("stalwart", stalwart_user)] {
+        let reply =
+            clients::submission_send_auth_login("127.0.0.1", port, mode, login, password).await;
+        assert!(
+            reply.contains("235"),
+            "AUTH LOGIN through the proxy to the {who} backend failed: {reply:?}"
+        );
+    }
+
+    let wrong =
+        clients::submission_send_auth_login("127.0.0.1", port, mode, legacy_user.0, "WrongPass#0")
+            .await;
+    assert!(
+        wrong.contains("535") || wrong.contains("454"),
+        "a bad password over AUTH LOGIN must still be rejected by the backend: {wrong:?}"
+    );
+}

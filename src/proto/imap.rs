@@ -325,19 +325,15 @@ impl Auth<'_> {
 
         match mech {
             Mechanism::Plain | Mechanism::OAuthBearer | Mechanism::XOauth2 => {}
-            Mechanism::Login => {
-                return self
-                    .reject(stream, tag, "AUTH LOGIN is not supported.")
-                    .await;
-            }
-            Mechanism::Other(_) => {
+            Mechanism::Login if common::sasl_offered(&self.caps.sasl, "LOGIN") => {}
+            _ => {
                 return self
                     .reject(stream, tag, "Unsupported authentication mechanism.")
                     .await;
             }
         }
 
-        if matches!(mech, Mechanism::Plain)
+        if matches!(mech, Mechanism::Plain | Mechanism::Login)
             && !plain_auth_allowed(self.caps.allow_plain_auth_without_tls, self.is_tls)
         {
             write(
@@ -347,6 +343,10 @@ impl Auth<'_> {
             )
             .await?;
             return Ok(Step::Continue);
+        }
+
+        if matches!(mech, Mechanism::Login) {
+            return self.authenticate_login(stream, tokens, tag, it).await;
         }
 
         let (raw_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
@@ -364,6 +364,48 @@ impl Auth<'_> {
         };
 
         self.finish(stream, mech, tag, raw, residual).await
+    }
+
+    async fn authenticate_login(
+        &mut self,
+        stream: &mut BoxedStream,
+        tokens: &[Token],
+        tag: &str,
+        it: &mut std::slice::Iter<'_, u8>,
+    ) -> Result<Step> {
+        let (user_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
+            (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+        } else {
+            write(
+                &mut *stream,
+                format!("+ {}\r\n", common::LOGIN_USERNAME_CHALLENGE).as_bytes(),
+            )
+            .await?;
+            let seed = it.as_slice().to_vec();
+            read_crlf_line(stream, seed, MAX_PREAUTH).await?
+        };
+        if common::sasl_cancelled(&user_b64) {
+            return self.reject(stream, tag, "Authentication cancelled.").await;
+        }
+
+        write(
+            &mut *stream,
+            format!("+ {}\r\n", common::LOGIN_PASSWORD_CHALLENGE).as_bytes(),
+        )
+        .await?;
+        let (pass_b64, residual) = read_crlf_line(stream, residual, MAX_PREAUTH).await?;
+        if common::sasl_cancelled(&pass_b64) {
+            return self.reject(stream, tag, "Authentication cancelled.").await;
+        }
+
+        let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
+            return self
+                .reject(stream, tag, "Invalid base64 in SASL response.")
+                .await;
+        };
+
+        self.finish(stream, Mechanism::Plain, tag, raw, residual)
+            .await
     }
 
     async fn login(

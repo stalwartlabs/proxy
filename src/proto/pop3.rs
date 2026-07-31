@@ -220,6 +220,7 @@ async fn preauth(
                 let mech = Mechanism::parse(mech_bytes);
                 match &mech {
                     Mechanism::Plain | Mechanism::OAuthBearer | Mechanism::XOauth2 => {}
+                    Mechanism::Login if common::sasl_offered(&caps.sasl, "LOGIN") => {}
                     _ => {
                         write(&mut stream, b"-ERR unsupported mechanism\r\n").await?;
                         buf.drain(..consumed);
@@ -229,7 +230,7 @@ async fn preauth(
                         continue;
                     }
                 }
-                if matches!(mech, Mechanism::Plain) && !plain_ok {
+                if matches!(mech, Mechanism::Plain | Mechanism::Login) && !plain_ok {
                     write(
                         &mut stream,
                         b"-ERR cleartext authentication requires TLS\r\n",
@@ -237,6 +238,68 @@ async fn preauth(
                     .await?;
                     buf.drain(..consumed);
                     continue;
+                }
+
+                if matches!(mech, Mechanism::Login) {
+                    buf.drain(..consumed);
+                    let seed = std::mem::take(&mut buf);
+                    let (user_b64, rest) = if ir.is_empty() {
+                        write(
+                            &mut stream,
+                            format!("+ {}\r\n", common::LOGIN_USERNAME_CHALLENGE).as_bytes(),
+                        )
+                        .await?;
+                        common::read_crlf_line(&mut stream, seed, MAX_PREAUTH).await?
+                    } else {
+                        (ir.to_vec(), seed)
+                    };
+                    if common::sasl_cancelled(&user_b64) {
+                        buf = rest;
+                        write(&mut stream, b"-ERR authentication cancelled\r\n").await?;
+                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    write(
+                        &mut stream,
+                        format!("+ {}\r\n", common::LOGIN_PASSWORD_CHALLENGE).as_bytes(),
+                    )
+                    .await?;
+                    let (pass_b64, rest) =
+                        common::read_crlf_line(&mut stream, rest, MAX_PREAUTH).await?;
+                    buf = rest;
+                    if common::sasl_cancelled(&pass_b64) {
+                        write(&mut stream, b"-ERR authentication cancelled\r\n").await?;
+                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
+                        write(&mut stream, b"-ERR invalid base64\r\n").await?;
+                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                            return Ok(None);
+                        }
+                        continue;
+                    };
+                    let Some(cred) = credential_from_sasl(&Mechanism::Plain, &raw) else {
+                        write(&mut stream, b"-ERR malformed credentials\r\n").await?;
+                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                            return Ok(None);
+                        }
+                        continue;
+                    };
+                    let identifier =
+                        identifier_from_credential(&cred, &ctx.config.oauth.jwt_username_claim);
+                    let residual = std::mem::take(&mut buf);
+                    return Ok(Some(Handoff {
+                        stream,
+                        mech: Mechanism::Plain,
+                        raw_challenge: raw,
+                        identifier,
+                        residual,
+                    }));
                 }
 
                 let raw_b64: Vec<u8> = if !ir.is_empty() {

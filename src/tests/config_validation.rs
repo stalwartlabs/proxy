@@ -364,3 +364,140 @@ allow_plain_auth_without_tls = true
     );
     assert!(Config::parse_and_validate(&toml).is_ok());
 }
+
+fn submission_config_with_sasl(mapping: &str, sasl: &str) -> String {
+    format!(
+        r#"
+{}
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.submission]
+port = 587
+tls = "plain"
+
+[listener.submission]
+protocol = "submission"
+bind = ["127.0.0.1:587"]
+tls = "plain"
+
+[capabilities.submission]
+allow_plain_auth_without_tls = true
+sasl = {sasl}
+"#,
+        mapping_block(mapping)
+    )
+}
+
+#[test]
+fn default_sasl_set_includes_login() {
+    let m = mapping_file("");
+    let toml = format!(
+        r#"
+{}
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.submission]
+port = 587
+tls = "plain"
+
+[listener.submission]
+protocol = "submission"
+bind = ["127.0.0.1:587"]
+tls = "plain"
+"#,
+        mapping_block(&m.path().display().to_string())
+    );
+    let config = Config::parse_and_validate(&toml).unwrap();
+    for sasl in [
+        &config.capabilities.submission.sasl,
+        &config.capabilities.imap.sasl,
+        &config.capabilities.pop3.sasl,
+        &config.capabilities.managesieve.sasl,
+    ] {
+        assert!(
+            sasl.iter().any(|m| m == "LOGIN"),
+            "LOGIN missing from default sasl set {sasl:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_login_in_sasl_and_canonicalizes_case() {
+    let m = mapping_file("");
+    let toml = submission_config_with_sasl(
+        &m.path().display().to_string(),
+        r#"["plain", "Login", "oauthbearer"]"#,
+    );
+    let config = Config::parse_and_validate(&toml).unwrap();
+    assert_eq!(
+        config.capabilities.submission.sasl,
+        vec!["PLAIN", "LOGIN", "OAUTHBEARER"]
+    );
+}
+
+#[test]
+fn rejects_unsupported_sasl_mechanism() {
+    let m = mapping_file("");
+    let toml =
+        submission_config_with_sasl(&m.path().display().to_string(), r#"["PLAIN", "CRAM-MD5"]"#);
+    let err = Config::parse_and_validate(&toml).unwrap_err().to_string();
+    assert!(
+        err.contains("CRAM-MD5") && err.contains("capabilities.submission.sasl"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_sasl_mechanism() {
+    let m = mapping_file("");
+    let toml =
+        submission_config_with_sasl(&m.path().display().to_string(), r#"["PLAIN", "plain"]"#);
+    let err = Config::parse_and_validate(&toml).unwrap_err().to_string();
+    assert!(err.contains("more than once"), "unexpected error: {err}");
+}
+
+#[test]
+fn rejects_unsupported_sasl_mechanism_in_every_section() {
+    let m = mapping_file("");
+    for section in ["imap", "pop3", "managesieve"] {
+        let toml = format!(
+            r#"
+{}
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.imap]
+port = 143
+tls = "plain"
+
+[listener.imap]
+protocol = "imap"
+bind = ["127.0.0.1:143"]
+tls = "plain"
+
+[capabilities.{section}]
+sasl = ["NTLM"]
+"#,
+            mapping_block(&m.path().display().to_string())
+        );
+        let err = Config::parse_and_validate(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("capabilities.{section}.sasl")),
+            "unexpected error for {section}: {err}"
+        );
+    }
+}
