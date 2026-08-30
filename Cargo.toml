@@ -1,6 +1,6 @@
 [package]
 name = "proxy"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "AGPL-3.0-only OR LicenseRef-SEL"
 description = "Multi-protocol e-mail proxy"
@@ -49,8 +49,7 @@ rustls-platform-verifier = "0.7"
 [dev-dependencies]
 tempfile = "3"
 mockito = "1.7"
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["redis", "postgres"] }
+testcontainers = "0.28"
 pwhash = "1"
 jmap-client = { version = "0.4", default-features = false, features = ["websockets", "async", "aws_lc_rs"] }
 futures-util = "0.3"

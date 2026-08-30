@@ -4,16 +4,36 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use crate::config::SqlMappingConfig;
 use crate::route::store::sql::SqlStore;
 
+const POSTGRES_PORT: u16 = 5432;
+
+async fn postgres_container() -> ContainerAsync<GenericImage> {
+    GenericImage::new("postgres", "17-alpine")
+        .with_exposed_port(POSTGRES_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .start()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn sql_store_resolves_and_misses() {
-    let node = Postgres::default().start().await.unwrap();
-    let port = node.get_host_port_ipv4(5432).await.unwrap();
+    let node = postgres_container().await;
+    let port = node.get_host_port_ipv4(POSTGRES_PORT.tcp()).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
     sqlx::any::install_default_drivers();
@@ -49,8 +69,8 @@ async fn sql_store_resolves_and_misses() {
 
 #[tokio::test]
 async fn sql_store_upsert_and_remove() {
-    let node = Postgres::default().start().await.unwrap();
-    let port = node.get_host_port_ipv4(5432).await.unwrap();
+    let node = postgres_container().await;
+    let port = node.get_host_port_ipv4(POSTGRES_PORT.tcp()).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
     sqlx::any::install_default_drivers();

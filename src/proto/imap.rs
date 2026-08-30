@@ -78,10 +78,14 @@ pub async fn handle(
     let client_tls = stream.is_tls();
     let fwd = forward::ForwardInfo::new(peer, local, client_tls, None, ctx.config.server.proxy_ttl);
 
-    let auth_frame = format!(
-        "{tag} AUTHENTICATE {} {}\r\n",
-        mechanism_name(&mech),
-        BASE64.encode(&raw_challenge)
+    let mech_name = mechanism_name(&mech);
+    let response = BASE64.encode(&raw_challenge);
+    let auth = common::AuthFrame::inline(
+        format!("{tag} AUTHENTICATE {mech_name} {response}\r\n").into_bytes(),
+    )
+    .with_deferred(
+        format!("{tag} AUTHENTICATE {mech_name}\r\n").into_bytes(),
+        format!("{response}\r\n").into_bytes(),
     );
     let unavailable = format!("{tag} NO [UNAVAILABLE] backend unavailable\r\n");
 
@@ -95,7 +99,7 @@ pub async fn handle(
         started,
         "imap",
         common::AuthWire::Imap { tag },
-        auth_frame.as_bytes(),
+        &auth,
         unavailable.as_bytes(),
         MAX_PREAUTH,
         || open_backend(ctx, &dest_id, &fwd),
@@ -477,7 +481,7 @@ async fn open_backend(
     ctx: &Ctx,
     dest_id: &str,
     fwd: &forward::ForwardInfo,
-) -> Result<(BoxedStream, Vec<u8>)> {
+) -> Result<common::BackendLeg> {
     let common::DialedEndpoint {
         dest,
         ep,
@@ -490,6 +494,7 @@ async fn open_backend(
     let mut residual = Vec::new();
 
     let banner = outbound::read_line(&mut backend, &mut residual, MAX_PREAUTH).await?;
+    let mut sasl_ir = common::advertises_token(&banner, "SASL-IR");
 
     if ep.tls == TlsMode::Starttls {
         if banner.contains(&b'[') && !common::advertises_token(&banner, "STARTTLS") {
@@ -500,6 +505,7 @@ async fn open_backend(
         if !tagged_ok(&resp, b"P1") {
             return Err(ProxyError::backend("backend refused STARTTLS"));
         }
+        sasl_ir = common::advertises_token(&resp, "SASL-IR");
         backend = outbound::tls_connect(backend, &tls_cfg, dest).await?;
     }
 
@@ -509,7 +515,7 @@ async fn open_backend(
         forward::send_imap_id(&mut backend, &mut residual, &banner, fwd, MAX_PREAUTH).await?;
     }
 
-    Ok((backend, residual))
+    Ok(common::BackendLeg::new(backend, residual).with_initial_response(sasl_ir))
 }
 
 fn tagged_ok(line: &[u8], tag: &[u8]) -> bool {

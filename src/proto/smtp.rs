@@ -74,10 +74,13 @@ pub async fn handle_submission(
         ctx.config.server.proxy_ttl,
     );
 
-    let auth_frame = format!(
-        "AUTH {} {}\r\n",
-        mechanism_name(&mech),
-        BASE64.encode(&raw_challenge)
+    let auth = common::AuthFrame::inline(
+        format!(
+            "AUTH {} {}\r\n",
+            mechanism_name(&mech),
+            BASE64.encode(&raw_challenge)
+        )
+        .into_bytes(),
     );
 
     common::bridge_authenticated(
@@ -90,7 +93,7 @@ pub async fn handle_submission(
         started,
         "submission",
         common::AuthWire::Smtp,
-        auth_frame.as_bytes(),
+        &auth,
         b"421 4.3.0 backend unavailable\r\n",
         MAX_PREAUTH,
         || open_backend(ctx, &dest_id, &fwd),
@@ -523,7 +526,7 @@ async fn open_backend(
     ctx: &Ctx,
     dest_id: &str,
     fwd: &forward::ForwardInfo,
-) -> Result<(BoxedStream, Vec<u8>)> {
+) -> Result<common::BackendLeg> {
     let common::DialedEndpoint {
         dest,
         ep,
@@ -568,7 +571,7 @@ async fn open_backend(
         }
     }
 
-    Ok((backend, residual))
+    Ok(common::BackendLeg::new(backend, residual))
 }
 
 fn advertised_xclient_attrs(ehlo_reply: &[u8]) -> Vec<String> {

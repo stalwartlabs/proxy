@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.3] - 2026-08-30
+
+### Added
+
+### Changed
+
+### Fixed
+- IMAP authentication is no longer replayed with an inline initial response to backends that do not advertise `SASL-IR` (#4).
+
 ## [1.0.2] - 2026-07-31
 
 ### Added

@@ -623,6 +623,55 @@ pub async fn hold_login(ctx: &Ctx, identifier: Option<&str>) {
     }
 }
 
+pub struct BackendLeg {
+    pub stream: BoxedStream,
+    pub residual: Vec<u8>,
+    pub accepts_initial_response: bool,
+}
+
+impl BackendLeg {
+    pub fn new(stream: BoxedStream, residual: Vec<u8>) -> Self {
+        Self {
+            stream,
+            residual,
+            accepts_initial_response: true,
+        }
+    }
+
+    pub fn with_initial_response(mut self, accepted: bool) -> Self {
+        self.accepts_initial_response = accepted;
+        self
+    }
+}
+
+pub struct AuthFrame {
+    inline: Vec<u8>,
+    deferred: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl AuthFrame {
+    pub fn inline(frame: Vec<u8>) -> Self {
+        Self {
+            inline: frame,
+            deferred: None,
+        }
+    }
+
+    pub fn with_deferred(mut self, command: Vec<u8>, response: Vec<u8>) -> Self {
+        self.deferred = Some((command, response));
+        self
+    }
+
+    fn wire(&self, accepts_initial_response: bool) -> (&[u8], Option<&[u8]>) {
+        match &self.deferred {
+            Some((command, response)) if !accepts_initial_response => {
+                (command.as_slice(), Some(response.as_slice()))
+            }
+            _ => (self.inline.as_slice(), None),
+        }
+    }
+}
+
 pub enum AuthWire {
     Imap { tag: String },
     Pop3,
@@ -715,6 +764,7 @@ pub async fn complete_backend_auth(
     backend: &mut BoxedStream,
     residual: &mut Vec<u8>,
     wire: AuthWire,
+    mut pending_response: Option<&[u8]>,
     hide: bool,
     max: usize,
 ) -> Result<bool> {
@@ -723,7 +773,8 @@ pub async fn complete_backend_auth(
         let line = crate::outbound::read_line(backend, residual, max).await?;
         match classify_auth_line(&line, &wire) {
             AuthLine::Continuation => {
-                crate::outbound::write_all(backend, SASL_EMPTY_RESPONSE).await?;
+                let response = pending_response.take().unwrap_or(SASL_EMPTY_RESPONSE);
+                crate::outbound::write_all(backend, response).await?;
             }
             AuthLine::Passthrough => {
                 client_out.extend_from_slice(&line);
@@ -763,14 +814,14 @@ pub async fn bridge_authenticated<F, Fut>(
     started: Instant,
     label: &'static str,
     wire: AuthWire,
-    auth_frame: &[u8],
+    auth: &AuthFrame,
     unavailable: &[u8],
     max: usize,
     open: F,
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<(BoxedStream, Vec<u8>)>>,
+    Fut: Future<Output = Result<BackendLeg>>,
 {
     if let Some(id) = identifier
         && !crate::token::valid_routing_identifier(id)
@@ -784,7 +835,11 @@ where
         return Ok(());
     }
 
-    let (mut backend, mut backend_residual) = match establish(ctx, dest_id, peer, open).await {
+    let BackendLeg {
+        stream: mut backend,
+        residual: mut backend_residual,
+        accepts_initial_response,
+    } = match establish(ctx, dest_id, peer, open).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, protocol = label, destination = %dest_id, "backend unavailable");
@@ -793,6 +848,7 @@ where
         }
     };
 
+    let (auth_frame, pending_response) = auth.wire(accepts_initial_response);
     crate::outbound::write_all(&mut backend, auth_frame).await?;
 
     let hide = ctx.hide_auth_errors(dest_id);
@@ -803,6 +859,7 @@ where
             &mut backend,
             &mut backend_residual,
             wire,
+            pending_response,
             hide,
             max,
         ),
@@ -909,6 +966,37 @@ pub async fn read_crlf_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_frame_defers_initial_response_when_not_accepted() {
+        let frame = AuthFrame::inline(b"a1 AUTHENTICATE PLAIN AGFAYgBj\r\n".to_vec())
+            .with_deferred(
+                b"a1 AUTHENTICATE PLAIN\r\n".to_vec(),
+                b"AGFAYgBj\r\n".to_vec(),
+            );
+
+        assert_eq!(
+            frame.wire(true),
+            (b"a1 AUTHENTICATE PLAIN AGFAYgBj\r\n".as_slice(), None)
+        );
+        assert_eq!(
+            frame.wire(false),
+            (
+                b"a1 AUTHENTICATE PLAIN\r\n".as_slice(),
+                Some(b"AGFAYgBj\r\n".as_slice())
+            )
+        );
+    }
+
+    #[test]
+    fn auth_frame_without_deferred_form_stays_inline() {
+        let frame = AuthFrame::inline(b"AUTH PLAIN AGFAYgBj\r\n".to_vec());
+
+        assert_eq!(
+            frame.wire(false),
+            (b"AUTH PLAIN AGFAYgBj\r\n".as_slice(), None)
+        );
+    }
 
     #[test]
     fn advertises_token_handles_smtp_ehlo_continuation_lines() {

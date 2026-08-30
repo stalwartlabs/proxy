@@ -4,16 +4,28 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::redis::{REDIS_PORT, Redis};
+use testcontainers::{ContainerAsync, GenericImage};
 
 use crate::config::RedisMappingConfig;
 use crate::route::store::redis::RedisStore;
 
+const REDIS_PORT: u16 = 6379;
+
+async fn redis_container() -> ContainerAsync<GenericImage> {
+    GenericImage::new("redis", "7.4-alpine")
+        .with_exposed_port(REDIS_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn redis_store_resolves_and_misses() {
-    let node = Redis::default().start().await.unwrap();
-    let port = node.get_host_port_ipv4(REDIS_PORT).await.unwrap();
+    let node = redis_container().await;
+    let port = node.get_host_port_ipv4(REDIS_PORT.tcp()).await.unwrap();
     let url = format!("redis://127.0.0.1:{port}");
 
     let client = redis::Client::open(url.as_str()).unwrap();

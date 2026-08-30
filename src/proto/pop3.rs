@@ -65,10 +65,13 @@ pub async fn handle(
         ctx.config.server.proxy_ttl,
     );
 
-    let auth_frame = format!(
-        "AUTH {} {}\r\n",
-        mechanism_name(&mech),
-        BASE64.encode(&raw_challenge)
+    let auth = common::AuthFrame::inline(
+        format!(
+            "AUTH {} {}\r\n",
+            mechanism_name(&mech),
+            BASE64.encode(&raw_challenge)
+        )
+        .into_bytes(),
     );
 
     common::bridge_authenticated(
@@ -81,7 +84,7 @@ pub async fn handle(
         started,
         "pop3",
         common::AuthWire::Pop3,
-        auth_frame.as_bytes(),
+        &auth,
         b"-ERR backend unavailable\r\n",
         MAX_PREAUTH,
         || open_backend(ctx, &dest_id, &fwd),
@@ -404,7 +407,7 @@ async fn open_backend(
     ctx: &Ctx,
     dest_id: &str,
     fwd: &forward::ForwardInfo,
-) -> Result<(BoxedStream, Vec<u8>)> {
+) -> Result<common::BackendLeg> {
     let common::DialedEndpoint {
         dest,
         ep,
@@ -447,7 +450,7 @@ async fn open_backend(
         .await?;
     }
 
-    Ok((backend, residual))
+    Ok(common::BackendLeg::new(backend, residual))
 }
 
 async fn backend_advertises_stls(

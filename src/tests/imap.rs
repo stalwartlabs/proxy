@@ -57,7 +57,7 @@ async fn backend_expect_mech(
     mech: &'static str,
     want_user: &'static str,
 ) {
-    sock.write_all(b"* OK [CAPABILITY IMAP4rev2] backend ready\r\n")
+    sock.write_all(b"* OK [CAPABILITY IMAP4rev2 SASL-IR] backend ready\r\n")
         .await
         .unwrap();
 
@@ -650,5 +650,154 @@ tls = "starttls"
         "expected PRIVACYREQUIRED, got {:?}",
         String::from_utf8_lossy(&resp)
     );
+    handler.abort();
+}
+
+const EXCHANGE_GREETING: &[u8] =
+    b"* OK [CAPABILITY IMAP4 IMAP4rev1 AUTH=PLAIN AUTH=NTLM AUTH=GSSAPI UIDPLUS MOVE ID \
+      CHILDREN IDLE NAMESPACE LITERAL+] backend ready\r\n";
+
+async fn backend_without_sasl_ir(mut sock: tokio::net::TcpStream, want_user: &'static str) {
+    sock.write_all(EXCHANGE_GREETING).await.unwrap();
+
+    let command = read_line(&mut sock).await;
+    assert_eq!(
+        command, "a1 AUTHENTICATE PLAIN",
+        "backend without SASL-IR must not receive an inline initial response"
+    );
+    sock.write_all(b"+ \r\n").await.unwrap();
+
+    let response = read_line(&mut sock).await;
+    let raw = BASE64.decode(response.trim()).unwrap();
+    assert_eq!(
+        raw,
+        format!("\0{want_user}\0secret").into_bytes(),
+        "deferred initial response should carry the credentials"
+    );
+    sock.write_all(b"a1 OK [CAPABILITY IMAP4rev1] authenticated\r\n")
+        .await
+        .unwrap();
+
+    let _ = read_until(&mut sock, b"NOOP").await;
+    sock.write_all(b"a2 OK NOOP done\r\n").await.unwrap();
+}
+
+async fn run_against_backend_without_sasl_ir(
+    ctx: std::sync::Arc<crate::proto::common::Ctx>,
+    first: &[u8],
+) -> Vec<u8> {
+    let listener = ctx.config.listener["imap"].clone();
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40010".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _greeting = read_line(&mut client).await;
+    send(&mut client, first).await;
+    let resp = read_until(&mut client, b"a1 OK").await;
+    send(&mut client, b"a2 NOOP\r\n").await;
+    let mut resp = resp;
+    resp.extend_from_slice(&read_until(&mut client, b"a2 OK").await);
+    handler.abort();
+    resp
+}
+
+#[tokio::test]
+async fn imap_defers_initial_response_when_backend_lacks_sasl_ir() {
+    let (port, backend) =
+        dummy_backend(|sock| backend_without_sasl_ir(sock, "alice@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+
+    let ir = BASE64.encode(b"\0alice@example.com\0secret");
+    let resp = run_against_backend_without_sasl_ir(
+        ctx,
+        format!("a1 AUTHENTICATE PLAIN {ir}\r\n").as_bytes(),
+    )
+    .await;
+
+    assert!(
+        find(&resp, b"a1 OK").is_some(),
+        "expected a1 OK, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        find(&resp, b"a2 OK").is_some(),
+        "expected bridged a2 OK, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = backend.await;
+}
+
+#[tokio::test]
+async fn imap_login_defers_initial_response_when_backend_lacks_sasl_ir() {
+    let (port, backend) =
+        dummy_backend(|sock| backend_without_sasl_ir(sock, "bob@example.com")).await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+
+    let resp =
+        run_against_backend_without_sasl_ir(ctx, b"a1 LOGIN bob@example.com secret\r\n").await;
+
+    assert!(
+        find(&resp, b"a1 OK").is_some(),
+        "expected a1 OK, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    let _ = backend.await;
+}
+
+#[tokio::test]
+async fn imap_keeps_inline_initial_response_when_backend_advertises_sasl_ir() {
+    let (port, backend) = dummy_backend(|mut sock: tokio::net::TcpStream| async move {
+        sock.write_all(b"* OK [CAPABILITY IMAP4rev2 SASL-IR] backend ready\r\n")
+            .await
+            .unwrap();
+        let command = read_line(&mut sock).await;
+        let ir = BASE64.encode(b"\0dave@example.com\0secret");
+        assert_eq!(command, format!("a1 AUTHENTICATE PLAIN {ir}"));
+        sock.write_all(b"a1 OK authenticated\r\n").await.unwrap();
+        let _ = read_until(&mut sock, b"NOOP").await;
+        sock.write_all(b"a2 OK NOOP done\r\n").await.unwrap();
+    })
+    .await;
+    let mapping = mapping_file("");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "127.0.0.1:40011".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _greeting = read_line(&mut client).await;
+    let ir = BASE64.encode(b"\0dave@example.com\0secret");
+    send(
+        &mut client,
+        format!("a1 AUTHENTICATE PLAIN {ir}\r\n").as_bytes(),
+    )
+    .await;
+    let resp = read_until(&mut client, b"a1 OK").await;
+    assert!(find(&resp, b"a1 OK").is_some());
+    let _ = backend.await;
     handler.abort();
 }
