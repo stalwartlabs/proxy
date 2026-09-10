@@ -16,7 +16,7 @@ use crate::imap_receiver::{Command, Error as RecvError, Mechanism, Receiver, Sta
 use crate::net::BoxedStream;
 use crate::outbound;
 use crate::proto::common::{
-    self, Ctx, Handoff, assert_egress_encrypted, credential_from_sasl, mechanism_name,
+    self, Ctx, Handoff, assert_egress_encrypted, bump, credential_from_sasl, mechanism_name,
     plain_auth_allowed, write,
 };
 use crate::proto::forward;
@@ -28,80 +28,14 @@ const MAX_PREAUTH: usize = 64 * 1024;
 pub async fn handle(
     ctx: &Ctx,
     listener: &ListenerConfig,
-    stream: BoxedStream,
+    mut stream: BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<()> {
     let caps = &ctx.config.capabilities.managesieve;
-
-    let handoff = match timeout(
-        listener.preauth_timeout,
-        preauth(ctx, listener, caps, stream),
-    )
-    .await
-    {
-        Ok(Ok(Some(h))) => h,
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()),
-    };
-
-    let Handoff {
-        stream,
-        mech,
-        raw_challenge,
-        identifier,
-        residual,
-    } = handoff;
-
-    let identifier = ctx.routing_identifier(identifier);
-    let dest_id = ctx.resolve(identifier.as_deref()).await;
-    let started = std::time::Instant::now();
-    common::hold_login(ctx, identifier.as_deref()).await;
-    let fwd = forward::ForwardInfo::new(
-        peer,
-        local,
-        stream.is_tls(),
-        None,
-        ctx.config.server.proxy_ttl,
-    );
-
-    let auth = common::AuthFrame::inline(
-        format!(
-            "AUTHENTICATE \"{}\" \"{}\"\r\n",
-            mechanism_name(&mech),
-            BASE64.encode(&raw_challenge)
-        )
-        .into_bytes(),
-    );
-
-    common::bridge_authenticated(
-        ctx,
-        &dest_id,
-        stream,
-        peer,
-        identifier.as_deref(),
-        &residual,
-        started,
-        "managesieve",
-        common::AuthWire::ManageSieve,
-        &auth,
-        b"NO \"backend unavailable\"\r\n",
-        MAX_PREAUTH,
-        || open_backend(ctx, &dest_id, &fwd),
-    )
-    .await
-}
-
-async fn preauth(
-    ctx: &Ctx,
-    listener: &ListenerConfig,
-    caps: &ManageSieveCapabilities,
-    mut stream: BoxedStream,
-) -> Result<Option<Handoff>> {
-    let mut is_tls = stream.is_tls();
     let starttls_listener = listener.tls == TlsMode::Starttls;
 
+    let is_tls = stream.is_tls();
     write(
         &mut stream,
         ctx.greetings
@@ -111,21 +45,115 @@ async fn preauth(
     )
     .await?;
 
+    let mut seed = Vec::new();
+    let mut auth_failures = 0u32;
+
+    loop {
+        let handoff = match timeout(
+            listener.preauth_timeout,
+            preauth(ctx, listener, caps, stream, seed, &mut auth_failures),
+        )
+        .await
+        {
+            Ok(Ok(Some(h))) => h,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+
+        let Handoff {
+            stream: client,
+            mech,
+            raw_challenge,
+            identifier,
+            residual,
+        } = handoff;
+
+        let identifier = ctx.routing_identifier(identifier);
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
+        let started = std::time::Instant::now();
+        common::hold_login(ctx, identifier.as_deref()).await;
+        let fwd = forward::ForwardInfo::new(
+            peer,
+            local,
+            client.is_tls(),
+            None,
+            ctx.config.server.proxy_ttl,
+        );
+
+        let auth = common::AuthFrame::inline(
+            format!(
+                "AUTHENTICATE \"{}\" \"{}\"\r\n",
+                mechanism_name(&mech),
+                BASE64.encode(&raw_challenge)
+            )
+            .into_bytes(),
+        );
+
+        let resume = common::bridge_authenticated(
+            ctx,
+            &dest_id,
+            client,
+            peer,
+            identifier.as_deref(),
+            residual,
+            started,
+            "managesieve",
+            common::AuthWire::ManageSieve,
+            &auth,
+            b"NO \"backend unavailable\"\r\n",
+            MAX_PREAUTH,
+            || open_backend(ctx, &dest_id, &fwd),
+        )
+        .await?;
+
+        let Some(common::Resume {
+            stream: client,
+            buf,
+        }) = resume
+        else {
+            return Ok(());
+        };
+        if bump(&mut auth_failures, listener.max_auth_attempts) {
+            return Ok(());
+        }
+        stream = client;
+        seed = buf;
+    }
+}
+
+async fn preauth(
+    ctx: &Ctx,
+    listener: &ListenerConfig,
+    caps: &ManageSieveCapabilities,
+    mut stream: BoxedStream,
+    seed: Vec<u8>,
+    auth_failures: &mut u32,
+) -> Result<Option<Handoff>> {
+    let mut is_tls = stream.is_tls();
+    let starttls_listener = listener.tls == TlsMode::Starttls;
+
     let mut receiver =
         Receiver::<Command>::new().with_start_state(State::Command { is_uid: false });
     receiver.max_request_size = MAX_PREAUTH;
-    let mut auth_failures = 0u32;
     let mut read = [0u8; 8192];
+    let mut pending = seed;
 
     loop {
-        let n = stream
-            .read(&mut read)
-            .await
-            .map_err(|e| ProxyError::Protocol(format!("reading client: {e}").into()))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let mut it = read[..n].iter();
+        let chunk: &[u8] = if pending.is_empty() {
+            let n = stream
+                .read(&mut read)
+                .await
+                .map_err(|e| ProxyError::Protocol(format!("reading client: {e}").into()))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            &read[..n]
+        } else {
+            &pending
+        };
+        let mut it = chunk.iter();
+        let mut carry: Option<Vec<u8>> = None;
 
         loop {
             match receiver.parse(&mut it) {
@@ -179,7 +207,7 @@ async fn preauth(
                                 common::sasl_offered(&caps.sasl, "LOGIN"),
                                 &req.tokens,
                                 &mut it,
-                                &mut auth_failures,
+                                &mut *auth_failures,
                                 listener.max_auth_attempts,
                             )
                             .await?
@@ -197,6 +225,10 @@ async fn preauth(
                                         identifier,
                                         residual,
                                     }));
+                                }
+                                AuthStep::Resume { residual } => {
+                                    carry = Some(residual);
+                                    break;
                                 }
                                 AuthStep::Continue => {}
                                 AuthStep::Close => return Ok(None),
@@ -222,12 +254,16 @@ async fn preauth(
                         format!("NO \"{}\"\r\n", sanitize(&message)).as_bytes(),
                     )
                     .await?;
-                    auth_failures += 1;
-                    if auth_failures >= listener.max_auth_attempts {
+                    if bump(auth_failures, listener.max_auth_attempts) {
                         return Ok(None);
                     }
                 }
             }
+        }
+        drop(it);
+        match carry {
+            Some(rest) => pending = rest,
+            None => pending.clear(),
         }
     }
 }
@@ -240,6 +276,9 @@ enum AuthStep {
         residual: Vec<u8>,
     },
     Continue,
+    Resume {
+        residual: Vec<u8>,
+    },
     Close,
 }
 
@@ -262,7 +301,16 @@ async fn handle_authenticate(
     match mech {
         Mechanism::Plain | Mechanism::OAuthBearer | Mechanism::XOauth2 => {}
         Mechanism::Login if login_offered => {}
-        _ => return fail(stream, "Unsupported mechanism", auth_failures, max_attempts).await,
+        _ => {
+            return fail(
+                stream,
+                "Unsupported mechanism",
+                auth_failures,
+                max_attempts,
+                None,
+            )
+            .await;
+        }
     }
     if matches!(mech, Mechanism::Plain | Mechanism::Login) && !plain_ok {
         write(
@@ -278,18 +326,32 @@ async fn handle_authenticate(
     }
 
     let (raw_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
-        (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+        (ir.as_bytes().to_vec(), common::take_rest(it))
     } else {
         write(&mut *stream, b"{0}\r\n").await?;
-        let seed = it.as_slice().to_vec();
+        let seed = common::take_rest(it);
         read_sasl_response(stream, seed).await?
     };
 
     let Some(raw) = decode_sasl_ir(&raw_b64) else {
-        return fail(stream, "Invalid base64", auth_failures, max_attempts).await;
+        return fail(
+            stream,
+            "Invalid base64",
+            auth_failures,
+            max_attempts,
+            Some(residual),
+        )
+        .await;
     };
     let Some(cred) = credential_from_sasl(&mech, &raw) else {
-        return fail(stream, "Malformed credentials", auth_failures, max_attempts).await;
+        return fail(
+            stream,
+            "Malformed credentials",
+            auth_failures,
+            max_attempts,
+            Some(residual),
+        )
+        .await;
     };
     let identifier = identifier_from_credential(&cred, &ctx.config.oauth.jwt_username_claim);
 
@@ -310,10 +372,10 @@ async fn authenticate_login(
     max_attempts: u32,
 ) -> Result<AuthStep> {
     let (user_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
-        (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+        (ir.as_bytes().to_vec(), common::take_rest(it))
     } else {
         write_challenge(stream, common::LOGIN_USERNAME_CHALLENGE).await?;
-        let seed = it.as_slice().to_vec();
+        let seed = common::take_rest(it);
         read_sasl_response(stream, seed).await?
     };
     if common::sasl_cancelled(&user_b64) {
@@ -322,6 +384,7 @@ async fn authenticate_login(
             "Authentication cancelled",
             auth_failures,
             max_attempts,
+            Some(residual),
         )
         .await;
     }
@@ -334,15 +397,30 @@ async fn authenticate_login(
             "Authentication cancelled",
             auth_failures,
             max_attempts,
+            Some(residual),
         )
         .await;
     }
 
     let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
-        return fail(stream, "Invalid base64", auth_failures, max_attempts).await;
+        return fail(
+            stream,
+            "Invalid base64",
+            auth_failures,
+            max_attempts,
+            Some(residual),
+        )
+        .await;
     };
     let Some(cred) = credential_from_sasl(&Mechanism::Plain, &raw) else {
-        return fail(stream, "Malformed credentials", auth_failures, max_attempts).await;
+        return fail(
+            stream,
+            "Malformed credentials",
+            auth_failures,
+            max_attempts,
+            Some(residual),
+        )
+        .await;
     };
     let identifier = identifier_from_credential(&cred, &ctx.config.oauth.jwt_username_claim);
 
@@ -367,14 +445,16 @@ async fn fail(
     message: &str,
     auth_failures: &mut u32,
     max_attempts: u32,
+    residual: Option<Vec<u8>>,
 ) -> Result<AuthStep> {
     write(&mut *stream, format!("NO \"{message}\"\r\n").as_bytes()).await?;
-    *auth_failures += 1;
-    if *auth_failures >= max_attempts {
-        Ok(AuthStep::Close)
-    } else {
-        Ok(AuthStep::Continue)
+    if bump(auth_failures, max_attempts) {
+        return Ok(AuthStep::Close);
     }
+    Ok(match residual {
+        Some(residual) => AuthStep::Resume { residual },
+        None => AuthStep::Continue,
+    })
 }
 
 async fn read_sasl_response(stream: &mut BoxedStream, seed: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {

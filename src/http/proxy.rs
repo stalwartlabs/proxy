@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use crate::config::{ForwardedMode, ListenerConfig, Protocol, TlsMode};
 use crate::error::{ProxyError, Result};
 use crate::net::BoxedStream;
-use crate::proto::common::Ctx;
+use crate::proto::common::{ConnGuard, Ctx};
 
 use super::head::{BodyFraming, Head, ParseError, ParseOutcome, error_response};
 use super::router::{HttpRouter, RouteOutcome};
@@ -379,12 +379,55 @@ fn response_no_body(req_method: &str, head: &Head) -> bool {
     matches!(head.framing, BodyFraming::None)
 }
 
+struct Account {
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+    guard: Option<ConnGuard>,
+    pinned: Option<String>,
+}
+
+impl Account {
+    fn new(cancel: tokio::sync::watch::Sender<bool>) -> Self {
+        Account {
+            cancel: Some(cancel),
+            guard: None,
+            pinned: None,
+        }
+    }
+
+    fn accepts(&self, ctx: &Ctx, identifier: Option<&str>) -> bool {
+        match (&self.pinned, identifier) {
+            (Some(pinned), Some(id)) => *pinned == ctx.router.normalize(id),
+            _ => true,
+        }
+    }
+
+    fn pin(&mut self, ctx: &Ctx, identifier: Option<&str>) -> bool {
+        if self.pinned.is_some() {
+            return false;
+        }
+        let Some(id) = identifier else {
+            return false;
+        };
+        let Some(cancel) = self.cancel.take() else {
+            return false;
+        };
+        self.pinned = Some(ctx.router.normalize(id));
+        self.guard = Some(ctx.register_conn_cancel(id, cancel));
+        true
+    }
+
+    fn into_guard(self) -> Option<ConnGuard> {
+        self.guard
+    }
+}
+
 enum Disposition {
     Close,
     Hijack {
         backend: BoxedStream,
         to_backend: Vec<u8>,
         to_client: Vec<u8>,
+        guard: Option<ConnGuard>,
     },
 }
 
@@ -400,7 +443,16 @@ pub async fn handle(
     local: SocketAddr,
 ) -> Result<()> {
     let bridge_idle = ctx.config.server.bridge_idle;
-    match serve(ctx, listener, &mut stream, peer, local).await {
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let served = tokio::select! {
+        result = serve(ctx, listener, &mut stream, peer, local, cancel_tx) => result,
+        _ = crate::outbound::wait_kick(Some(cancel_rx)) => {
+            return Err(ProxyError::backend("disconnected by admin"));
+        }
+    };
+
+    match served {
         Ok(Disposition::Close) => {
             shutdown_client(&mut stream).await;
             Ok(())
@@ -409,9 +461,18 @@ pub async fn handle(
             backend,
             to_backend,
             to_client,
+            guard,
         }) => {
-            crate::outbound::bridge(stream, backend, &to_backend, &to_client, bridge_idle, None)
-                .await?;
+            let cancel = guard.as_ref().map(|g| g.cancel());
+            crate::outbound::bridge(
+                stream,
+                backend,
+                &to_backend,
+                &to_client,
+                bridge_idle,
+                cancel,
+            )
+            .await?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -424,6 +485,7 @@ async fn serve(
     stream: &mut BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
+    cancel: tokio::sync::watch::Sender<bool>,
 ) -> Result<Disposition> {
     let router = ctx.http_router.as_ref();
     let max_head = router.max_head_size;
@@ -459,7 +521,11 @@ async fn serve(
     let mut first_head = first_head;
     sanitize_inbound_forwarded(&mut first_head, listener);
 
-    let (buffered_body, dest_id) = match prepare(
+    let Prepared {
+        body: buffered_body,
+        dest_id,
+        identifier,
+    } = match prepare(
         ctx,
         router,
         stream,
@@ -476,6 +542,11 @@ async fn serve(
             return Ok(Disposition::Close);
         }
     };
+
+    let mut account = Account::new(cancel);
+    if account.pin(ctx, identifier.as_deref()) {
+        crate::proto::common::hold_login(ctx, identifier.as_deref()).await;
+    }
 
     let (dest, ep, tls_cfg) = match ctx.endpoint(&dest_id, Protocol::Http) {
         Ok(t) => t,
@@ -552,6 +623,7 @@ async fn serve(
                     backend,
                     to_backend,
                     to_client,
+                    guard: account.into_guard(),
                 });
             }
             Ok(ExchangeResult::Close) => return Ok(Disposition::Close),
@@ -576,7 +648,11 @@ async fn serve(
         let mut next = next;
         sanitize_inbound_forwarded(&mut next, listener);
 
-        let (next_body, next_dest) = match prepare(
+        let Prepared {
+            body: next_body,
+            dest_id: next_dest,
+            identifier: next_identifier,
+        } = match prepare(
             ctx,
             router,
             stream,
@@ -594,7 +670,7 @@ async fn serve(
             }
         };
 
-        if next_dest != dest_id {
+        if next_dest != dest_id || !account.accepts(ctx, next_identifier.as_deref()) {
             if let Some(body) = &next_body {
                 drain_buffered(stream, &mut reader, &next, body.len(), idle.body)
                     .await
@@ -602,6 +678,9 @@ async fn serve(
             }
             let _ = write_client(stream, &error_response(421, "Misdirected Request")).await;
             return Ok(Disposition::Close);
+        }
+        if account.pin(ctx, next_identifier.as_deref()) {
+            crate::proto::common::hold_login(ctx, next_identifier.as_deref()).await;
         }
 
         current_head = next;
@@ -891,6 +970,12 @@ async fn drain_buffered(
     Ok(())
 }
 
+struct Prepared {
+    body: Option<Vec<u8>>,
+    dest_id: String,
+    identifier: Option<String>,
+}
+
 async fn prepare(
     ctx: &Ctx,
     router: &HttpRouter,
@@ -899,7 +984,7 @@ async fn prepare(
     head: &mut Head,
     body_cap: usize,
     body_idle: Duration,
-) -> Result<Option<(Option<Vec<u8>>, String)>> {
+) -> Result<Option<Prepared>> {
     let idx = match router.match_index(head) {
         Some(i) => i,
         None => return Ok(None),
@@ -915,21 +1000,27 @@ async fn prepare(
         None
     };
 
-    let dest_id = match router.route_at(idx, head, body.as_deref()) {
-        RouteOutcome::Pin { dest_id } => dest_id,
+    let (dest_id, identifier) = match router.route_at(idx, head, body.as_deref()) {
+        RouteOutcome::Pin { dest_id } => (dest_id, None),
         RouteOutcome::Identifier {
             identifier,
             fallback,
         } => {
-            if identifier.is_none() && fallback.is_none() {
+            let identifier = ctx.routing_identifier(identifier);
+            let dest_id = if identifier.is_none() && fallback.is_none() {
                 ctx.resolve(None).await.to_string()
             } else {
                 ctx.resolve(identifier.as_deref()).await.to_string()
-            }
+            };
+            (dest_id, identifier)
         }
     };
 
-    Ok(Some((body, dest_id)))
+    Ok(Some(Prepared {
+        body,
+        dest_id,
+        identifier,
+    }))
 }
 
 fn reason(status: u16) -> &'static str {

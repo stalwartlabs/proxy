@@ -39,72 +39,100 @@ enum Decision {
 pub async fn handle(
     ctx: &Ctx,
     listener: &ListenerConfig,
-    stream: BoxedStream,
+    mut stream: BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<()> {
     let caps = &ctx.config.capabilities.imap;
+    let starttls_listener = listener.tls == TlsMode::Starttls;
 
-    let decision = match timeout(
-        listener.preauth_timeout,
-        preauth(ctx, listener, caps, stream),
-    )
-    .await
-    {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()),
-    };
-
-    let Decision::Authenticate {
-        stream,
-        mech,
-        tag,
-        raw_challenge,
-        identifier,
-        residual,
-    } = decision
-    else {
-        return Ok(());
-    };
-
-    let identifier = ctx.routing_identifier(identifier);
-    let dest_id = ctx.resolve(identifier.as_deref()).await;
-    tracing::debug!(destination = %dest_id, "imap routing decision");
-
-    let started = std::time::Instant::now();
-    common::hold_login(ctx, identifier.as_deref()).await;
-
-    let client_tls = stream.is_tls();
-    let fwd = forward::ForwardInfo::new(peer, local, client_tls, None, ctx.config.server.proxy_ttl);
-
-    let mech_name = mechanism_name(&mech);
-    let response = BASE64.encode(&raw_challenge);
-    let auth = common::AuthFrame::inline(
-        format!("{tag} AUTHENTICATE {mech_name} {response}\r\n").into_bytes(),
-    )
-    .with_deferred(
-        format!("{tag} AUTHENTICATE {mech_name}\r\n").into_bytes(),
-        format!("{response}\r\n").into_bytes(),
+    let is_tls = stream.is_tls();
+    let greeting = format!(
+        "* OK [CAPABILITY {}] {}\r\n",
+        ctx.greetings.imap.get(is_tls, starttls_listener && !is_tls),
+        caps.banner
     );
-    let unavailable = format!("{tag} NO [UNAVAILABLE] backend unavailable\r\n");
+    write(&mut stream, greeting.as_bytes()).await?;
 
-    common::bridge_authenticated(
-        ctx,
-        &dest_id,
-        stream,
-        peer,
-        identifier.as_deref(),
-        &residual,
-        started,
-        "imap",
-        common::AuthWire::Imap { tag },
-        &auth,
-        unavailable.as_bytes(),
-        MAX_PREAUTH,
-        || open_backend(ctx, &dest_id, &fwd),
-    )
-    .await
+    let mut seed = Vec::new();
+    let mut auth_failures = 0u32;
+
+    loop {
+        let decision = match timeout(
+            listener.preauth_timeout,
+            preauth(ctx, listener, caps, stream, seed, &mut auth_failures),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+
+        let Decision::Authenticate {
+            stream: client,
+            mech,
+            tag,
+            raw_challenge,
+            identifier,
+            residual,
+        } = decision
+        else {
+            return Ok(());
+        };
+
+        let identifier = ctx.routing_identifier(identifier);
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
+        tracing::debug!(destination = %dest_id, "imap routing decision");
+
+        let started = std::time::Instant::now();
+        common::hold_login(ctx, identifier.as_deref()).await;
+
+        let client_tls = client.is_tls();
+        let fwd =
+            forward::ForwardInfo::new(peer, local, client_tls, None, ctx.config.server.proxy_ttl);
+
+        let mech_name = mechanism_name(&mech);
+        let response = BASE64.encode(&raw_challenge);
+        let auth = common::AuthFrame::inline(
+            format!("{tag} AUTHENTICATE {mech_name} {response}\r\n").into_bytes(),
+        )
+        .with_deferred(
+            format!("{tag} AUTHENTICATE {mech_name}\r\n").into_bytes(),
+            format!("{response}\r\n").into_bytes(),
+        );
+        let unavailable = format!("{tag} NO [UNAVAILABLE] backend unavailable\r\n");
+
+        let resume = common::bridge_authenticated(
+            ctx,
+            &dest_id,
+            client,
+            peer,
+            identifier.as_deref(),
+            residual,
+            started,
+            "imap",
+            common::AuthWire::Imap { tag },
+            &auth,
+            unavailable.as_bytes(),
+            MAX_PREAUTH,
+            || open_backend(ctx, &dest_id, &fwd),
+        )
+        .await?;
+
+        let Some(common::Resume {
+            stream: client,
+            buf,
+        }) = resume
+        else {
+            return Ok(());
+        };
+        if common::bump(&mut auth_failures, listener.max_auth_attempts) {
+            return Ok(());
+        }
+        stream = client;
+        seed = buf;
+    }
 }
 
 async fn preauth(
@@ -112,6 +140,8 @@ async fn preauth(
     listener: &ListenerConfig,
     caps: &ImapCapabilities,
     mut stream: BoxedStream,
+    seed: Vec<u8>,
+    auth_failures: &mut u32,
 ) -> Result<Decision> {
     let starttls_listener = listener.tls == TlsMode::Starttls;
     let mut auth = Auth {
@@ -119,31 +149,29 @@ async fn preauth(
         caps,
         is_tls: stream.is_tls(),
         max_attempts: listener.max_auth_attempts,
-        auth_failures: 0,
+        auth_failures,
     };
-
-    let greeting = format!(
-        "* OK [CAPABILITY {}] {}\r\n",
-        ctx.greetings
-            .imap
-            .get(auth.is_tls, starttls_listener && !auth.is_tls),
-        caps.banner
-    );
-    write(&mut stream, greeting.as_bytes()).await?;
 
     let mut receiver = Receiver::<Command>::new();
     receiver.max_request_size = MAX_PREAUTH;
     let mut read = [0u8; 8192];
+    let mut pending = seed;
 
     loop {
-        let n = stream
-            .read(&mut read)
-            .await
-            .map_err(|e| ProxyError::Protocol(format!("reading client: {e}").into()))?;
-        if n == 0 {
-            return Ok(Decision::Closed);
-        }
-        let mut it = read[..n].iter();
+        let chunk: &[u8] = if pending.is_empty() {
+            let n = stream
+                .read(&mut read)
+                .await
+                .map_err(|e| ProxyError::Protocol(format!("reading client: {e}").into()))?;
+            if n == 0 {
+                return Ok(Decision::Closed);
+            }
+            &read[..n]
+        } else {
+            &pending
+        };
+        let mut it = chunk.iter();
+        let mut carry: Option<Vec<u8>> = None;
 
         loop {
             match receiver.parse(&mut it) {
@@ -234,6 +262,10 @@ async fn preauth(
                                         residual,
                                     });
                                 }
+                                Step::Resume { residual } => {
+                                    carry = Some(residual);
+                                    break;
+                                }
                                 Step::Continue => {}
                                 Step::Close => return Ok(Decision::Closed),
                             }
@@ -254,6 +286,10 @@ async fn preauth(
                                         identifier,
                                         residual,
                                     });
+                                }
+                                Step::Resume { residual } => {
+                                    carry = Some(residual);
+                                    break;
                                 }
                                 Step::Continue => {}
                                 Step::Close => return Ok(Decision::Closed),
@@ -280,12 +316,16 @@ async fn preauth(
                 }
                 Err(RecvError::Parse { message }) => {
                     write(&mut stream, format!("* BAD {message}\r\n").as_bytes()).await?;
-                    auth.auth_failures += 1;
-                    if auth.auth_failures >= auth.max_attempts {
+                    if common::bump(auth.auth_failures, auth.max_attempts) {
                         return Ok(Decision::Closed);
                     }
                 }
             }
+        }
+        drop(it);
+        match carry {
+            Some(rest) => pending = rest,
+            None => pending.clear(),
         }
     }
 }
@@ -295,11 +335,14 @@ struct Auth<'a> {
     caps: &'a ImapCapabilities,
     is_tls: bool,
     max_attempts: u32,
-    auth_failures: u32,
+    auth_failures: &'a mut u32,
 }
 
 enum Step {
     Continue,
+    Resume {
+        residual: Vec<u8>,
+    },
     Close,
     Finalize {
         mech: Mechanism,
@@ -332,7 +375,7 @@ impl Auth<'_> {
             Mechanism::Login if common::sasl_offered(&self.caps.sasl, "LOGIN") => {}
             _ => {
                 return self
-                    .reject(stream, tag, "Unsupported authentication mechanism.")
+                    .reject(stream, tag, "Unsupported authentication mechanism.", None)
                     .await;
             }
         }
@@ -354,16 +397,21 @@ impl Auth<'_> {
         }
 
         let (raw_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
-            (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+            (ir.as_bytes().to_vec(), common::take_rest(it))
         } else {
             write(&mut *stream, b"+ \r\n").await?;
-            let seed = it.as_slice().to_vec();
+            let seed = common::take_rest(it);
             read_crlf_line(stream, seed, MAX_PREAUTH).await?
         };
 
         let Some(raw) = decode_sasl_ir(&raw_b64) else {
             return self
-                .reject(stream, tag, "Invalid base64 in SASL response.")
+                .reject(
+                    stream,
+                    tag,
+                    "Invalid base64 in SASL response.",
+                    Some(residual),
+                )
                 .await;
         };
 
@@ -378,18 +426,20 @@ impl Auth<'_> {
         it: &mut std::slice::Iter<'_, u8>,
     ) -> Result<Step> {
         let (user_b64, residual): (Vec<u8>, Vec<u8>) = if let Some(ir) = tokens.get(1) {
-            (ir.as_bytes().to_vec(), it.as_slice().to_vec())
+            (ir.as_bytes().to_vec(), common::take_rest(it))
         } else {
             write(
                 &mut *stream,
                 format!("+ {}\r\n", common::LOGIN_USERNAME_CHALLENGE).as_bytes(),
             )
             .await?;
-            let seed = it.as_slice().to_vec();
+            let seed = common::take_rest(it);
             read_crlf_line(stream, seed, MAX_PREAUTH).await?
         };
         if common::sasl_cancelled(&user_b64) {
-            return self.reject(stream, tag, "Authentication cancelled.").await;
+            return self
+                .reject(stream, tag, "Authentication cancelled.", Some(residual))
+                .await;
         }
 
         write(
@@ -399,12 +449,19 @@ impl Auth<'_> {
         .await?;
         let (pass_b64, residual) = read_crlf_line(stream, residual, MAX_PREAUTH).await?;
         if common::sasl_cancelled(&pass_b64) {
-            return self.reject(stream, tag, "Authentication cancelled.").await;
+            return self
+                .reject(stream, tag, "Authentication cancelled.", Some(residual))
+                .await;
         }
 
         let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
             return self
-                .reject(stream, tag, "Invalid base64 in SASL response.")
+                .reject(
+                    stream,
+                    tag,
+                    "Invalid base64 in SASL response.",
+                    Some(residual),
+                )
                 .await;
         };
 
@@ -429,7 +486,7 @@ impl Auth<'_> {
         }
         let (Some(user), Some(pass)) = (tokens.first(), tokens.get(1)) else {
             return self
-                .reject(stream, tag, "LOGIN requires a username and password.")
+                .reject(stream, tag, "LOGIN requires a username and password.", None)
                 .await;
         };
         let (user, pass) = (user.as_bytes(), pass.as_bytes());
@@ -438,7 +495,7 @@ impl Auth<'_> {
         raw.extend_from_slice(user);
         raw.push(0);
         raw.extend_from_slice(pass);
-        let residual = it.as_slice().to_vec();
+        let residual = common::take_rest(it);
 
         self.finish(stream, Mechanism::Plain, tag, raw, residual)
             .await
@@ -453,7 +510,9 @@ impl Auth<'_> {
         residual: Vec<u8>,
     ) -> Result<Step> {
         let Some(cred) = common::credential_from_sasl(&mech, &raw) else {
-            return self.reject(stream, tag, "Malformed credentials.").await;
+            return self
+                .reject(stream, tag, "Malformed credentials.", Some(residual))
+                .await;
         };
         let identifier =
             identifier_from_credential(&cred, &self.ctx.config.oauth.jwt_username_claim);
@@ -466,14 +525,21 @@ impl Auth<'_> {
         })
     }
 
-    async fn reject(&mut self, stream: &mut BoxedStream, tag: &str, message: &str) -> Result<Step> {
+    async fn reject(
+        &mut self,
+        stream: &mut BoxedStream,
+        tag: &str,
+        message: &str,
+        residual: Option<Vec<u8>>,
+    ) -> Result<Step> {
         write(&mut *stream, format!("{tag} NO {message}\r\n").as_bytes()).await?;
-        self.auth_failures += 1;
-        if self.auth_failures >= self.max_attempts {
-            Ok(Step::Close)
-        } else {
-            Ok(Step::Continue)
+        if common::bump(self.auth_failures, self.max_attempts) {
+            return Ok(Step::Close);
         }
+        Ok(match residual {
+            Some(residual) => Step::Resume { residual },
+            None => Step::Continue,
+        })
     }
 }
 

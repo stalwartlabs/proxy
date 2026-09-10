@@ -33,6 +33,22 @@ pub struct Handoff {
     pub residual: Vec<u8>,
 }
 
+pub struct Resume {
+    pub stream: BoxedStream,
+    pub buf: Vec<u8>,
+}
+
+pub fn take_rest(it: &mut std::slice::Iter<'_, u8>) -> Vec<u8> {
+    let rest = it.as_slice().to_vec();
+    *it = Default::default();
+    rest
+}
+
+pub fn bump(failures: &mut u32, max: u32) -> bool {
+    *failures += 1;
+    *failures >= max
+}
+
 pub fn credential_from_sasl(mech: &Mechanism, raw: &[u8]) -> Option<Credential> {
     match mech {
         Mechanism::Plain => Credential::decode_sasl_challenge_plain(raw),
@@ -326,9 +342,27 @@ impl ConnRegistry {
     }
 
     pub fn register(&self, identifier: &str) -> ConnGuard {
+        let (cancel, rx) = tokio::sync::watch::channel(false);
+        self.insert(identifier, cancel, rx)
+    }
+
+    pub fn register_cancel(
+        &self,
+        identifier: &str,
+        cancel: tokio::sync::watch::Sender<bool>,
+    ) -> ConnGuard {
+        let rx = cancel.subscribe();
+        self.insert(identifier, cancel, rx)
+    }
+
+    fn insert(
+        &self,
+        identifier: &str,
+        cancel: tokio::sync::watch::Sender<bool>,
+        rx: tokio::sync::watch::Receiver<bool>,
+    ) -> ConnGuard {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (cancel, rx) = tokio::sync::watch::channel(false);
         let key: Arc<str> = Arc::from(identifier);
         let shard_idx = self.shard_idx(&key);
         self.shards[shard_idx]
@@ -513,11 +547,21 @@ impl Ctx {
         self.conns.register(&self.router.normalize(identifier))
     }
 
+    pub fn register_conn_cancel(
+        &self,
+        identifier: &str,
+        cancel: tokio::sync::watch::Sender<bool>,
+    ) -> ConnGuard {
+        self.conns
+            .register_cancel(&self.router.normalize(identifier), cancel)
+    }
+
     pub fn routing_identifier(&self, identifier: Option<String>) -> Option<String> {
-        identifier.map(|id| {
-            crate::route::master_account(&id, &self.config.routing.master_user_separators)
-                .to_string()
-        })
+        let mut id = identifier?;
+        let account =
+            crate::route::master_account(&id, &self.config.routing.master_user_separators);
+        id.truncate(account.len());
+        (!id.is_empty()).then_some(id)
     }
 
     pub fn hide_auth_errors(&self, dest_id: &str) -> bool {
@@ -679,6 +723,16 @@ pub enum AuthWire {
     ManageSieve,
 }
 
+impl AuthWire {
+    fn logout(&self) -> &'static [u8] {
+        match self {
+            AuthWire::Imap { .. } => b"ZZ LOGOUT\r\n",
+            AuthWire::Pop3 | AuthWire::Smtp => b"QUIT\r\n",
+            AuthWire::ManageSieve => b"LOGOUT\r\n",
+        }
+    }
+}
+
 enum AuthLine {
     Continuation,
     Passthrough,
@@ -810,7 +864,7 @@ pub async fn bridge_authenticated<F, Fut>(
     mut stream: BoxedStream,
     peer: SocketAddr,
     identifier: Option<&str>,
-    client_residual: &[u8],
+    client_residual: Vec<u8>,
     started: Instant,
     label: &'static str,
     wire: AuthWire,
@@ -818,7 +872,7 @@ pub async fn bridge_authenticated<F, Fut>(
     unavailable: &[u8],
     max: usize,
     open: F,
-) -> Result<()>
+) -> Result<Option<Resume>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<BackendLeg>>,
@@ -832,7 +886,7 @@ where
             "rejecting login: routing identifier contains invalid characters"
         );
         let _ = write(&mut stream, unavailable).await;
-        return Ok(());
+        return Ok(None);
     }
 
     let BackendLeg {
@@ -844,10 +898,11 @@ where
         Err(e) => {
             tracing::warn!(error = %e, protocol = label, destination = %dest_id, "backend unavailable");
             let _ = write(&mut stream, unavailable).await;
-            return Ok(());
+            return Ok(None);
         }
     };
 
+    let logout = wire.logout();
     let (auth_frame, pending_response) = auth.wire(accepts_initial_response);
     crate::outbound::write_all(&mut backend, auth_frame).await?;
 
@@ -872,16 +927,26 @@ where
         }
     };
 
-    let guard = if auth_ok {
-        identifier.map(|id| ctx.register_conn(id))
-    } else {
-        None
-    };
+    if !auth_ok {
+        tracing::debug!(
+            protocol = label,
+            destination = %dest_id,
+            "backend rejected authentication; resuming pre-authentication dialogue"
+        );
+        let _ = crate::outbound::write_all(&mut backend, logout).await;
+        let _ = tokio::time::timeout(crate::outbound::SHUTDOWN_GRACE, backend.shutdown()).await;
+        return Ok(Some(Resume {
+            stream,
+            buf: client_residual,
+        }));
+    }
+
+    let guard = identifier.map(|id| ctx.register_conn(id));
     let cancel = guard.as_ref().map(|g| g.cancel());
     let (to_backend, to_client) = crate::outbound::bridge(
         stream,
         backend,
-        client_residual,
+        &client_residual,
         &backend_residual,
         ctx.config.server.bridge_idle,
         cancel,
@@ -895,7 +960,7 @@ where
         secs = started.elapsed().as_secs_f64(),
         "session closed"
     );
-    Ok(())
+    Ok(None)
 }
 
 pub async fn write(stream: &mut BoxedStream, bytes: &[u8]) -> Result<()> {

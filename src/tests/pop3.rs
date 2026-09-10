@@ -609,3 +609,366 @@ tls = "plain"
         String::from_utf8_lossy(&resp)
     );
 }
+
+fn retry_config(backend_port: u16, mapping_path: &str, max_auth_attempts: u32) -> String {
+    format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{mapping_path}"
+
+[capabilities.pop3]
+allow_plain_auth_without_tls = true
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+forwarding = "none"
+allow_plaintext_auth = true
+[destination.legacy.protocol.pop3]
+port = {backend_port}
+tls = "plain"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+max_auth_attempts = {max_auth_attempts}
+"#
+    )
+}
+
+async fn rejecting_backend(
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(unused_addr()).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = sock.set_nodelay(true);
+            tokio::spawn(async move {
+                if sock.write_all(b"+OK ready\r\n").await.is_err() {
+                    return;
+                }
+                let mut buf = Vec::new();
+                let mut scratch = [0u8; 1024];
+                while find(&buf, b"\r\n").is_none() {
+                    match sock.read(&mut scratch).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&scratch[..n]),
+                    }
+                }
+                let _ = sock.write_all(b"-ERR bad password\r\n").await;
+                let mut sink = [0u8; 1024];
+                loop {
+                    match sock.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn pop3_failed_backend_auth_does_not_hand_the_client_a_raw_bridge() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (backend_port, backend) = rejecting_backend(attempts.clone()).await;
+
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = retry_config(backend_port, &mapping.path().display().to_string(), 10);
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["pop3"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::pop3::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40000".parse().unwrap(),
+            "127.0.0.1:110".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_line(&mut client).await;
+    assert!(greeting.starts_with("+OK"), "greeting: {greeting}");
+
+    send(&mut client, b"USER user@example.com\r\nPASS wrong\r\n").await;
+    let failure = read_until(&mut client, b"-ERR").await;
+    assert!(find(&failure, b"-ERR").is_some(), "expected a rejection");
+
+    send(&mut client, b"CAPA\r\n").await;
+    let capa = read_until(&mut client, b"\r\n.\r\n").await;
+    assert!(
+        find(&capa, b"USER").is_some(),
+        "the proxy must still be parsing after a failed auth, got {:?}",
+        String::from_utf8_lossy(&capa)
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "CAPA must be answered by the proxy, not forwarded to a backend"
+    );
+
+    drop(client);
+    backend.abort();
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn pop3_rejected_auth_closes_the_backend_leg_with_quit() {
+    let (backend_port, backend) = dummy_backend(|mut sock| async move {
+        sock.write_all(b"+OK ready\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let mut scratch = [0u8; 1024];
+        while find(&buf, b"\r\n").is_none() {
+            match sock.read(&mut scratch).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            }
+        }
+        let _ = sock.write_all(b"-ERR bad password\r\n").await;
+        buf.clear();
+        loop {
+            match sock.read(&mut scratch).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            }
+        }
+        assert!(
+            find(&buf, b"QUIT").is_some(),
+            "backend leg must be closed with QUIT, saw {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    })
+    .await;
+
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = retry_config(backend_port, &mapping.path().display().to_string(), 10);
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["pop3"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::pop3::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40003".parse().unwrap(),
+            "127.0.0.1:110".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(&mut client, b"USER user@example.com\r\nPASS wrong\r\n").await;
+    let _ = read_until(&mut client, b"-ERR").await;
+
+    drop(client);
+    backend.await.expect("backend assertion failed");
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn pop3_backend_auth_failures_count_toward_max_auth_attempts() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (backend_port, backend) = rejecting_backend(attempts.clone()).await;
+
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = retry_config(backend_port, &mapping.path().display().to_string(), 2);
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["pop3"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::pop3::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40001".parse().unwrap(),
+            "127.0.0.1:110".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(&mut client, b"USER user@example.com\r\nPASS wrong\r\n").await;
+    let _ = read_until(&mut client, b"-ERR").await;
+    send(&mut client, b"USER user@example.com\r\nPASS wrong\r\n").await;
+
+    let tail = read_to_eof(&mut client).await;
+    assert!(
+        find(&tail, b"-ERR").is_some(),
+        "expected the second rejection, got {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "max_auth_attempts must bound the backend connections a client can force"
+    );
+
+    backend.abort();
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn pop3_retry_after_failed_auth_is_routed_and_registered_for_its_own_account() {
+    async fn accepting_backend(
+        seen: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(unused_addr()).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                let _ = sock.set_nodelay(true);
+                tokio::spawn(async move {
+                    if sock.write_all(b"+OK ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut buf = Vec::new();
+                    let mut scratch = [0u8; 1024];
+                    while find(&buf, b"\r\n").is_none() {
+                        match sock.read(&mut scratch).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+                        }
+                    }
+                    seen.lock().await.extend_from_slice(&buf);
+                    let _ = sock.write_all(b"+OK logged in\r\n").await;
+                    let mut sink = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut sink).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    let rejects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (legacy_port, legacy) = rejecting_backend(rejects.clone()).await;
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let (modern_port, modern) = accepting_backend(seen.clone()).await;
+
+    let mapping = mapping_file("alice@example.com\tlegacy\nbob@example.com\tmodern\n");
+    let toml = format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[capabilities.pop3]
+allow_plain_auth_without_tls = true
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+forwarding = "none"
+allow_plaintext_auth = true
+[destination.legacy.protocol.pop3]
+port = {legacy_port}
+tls = "plain"
+
+[destination.modern]
+host = "127.0.0.1"
+forwarding = "none"
+allow_plaintext_auth = true
+[destination.modern.protocol.pop3]
+port = {modern_port}
+tls = "plain"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+max_auth_attempts = 10
+"#,
+        mapping.path().display()
+    );
+
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["pop3"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::pop3::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40002".parse().unwrap(),
+            "127.0.0.1:110".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(&mut client, b"USER alice@example.com\r\nPASS wrong\r\n").await;
+    let _ = read_until(&mut client, b"-ERR").await;
+
+    send(&mut client, b"USER bob@example.com\r\nPASS right\r\n").await;
+    let ok = read_until(&mut client, b"+OK logged in").await;
+    assert!(
+        find(&ok, b"+OK logged in").is_some(),
+        "second account should authenticate, got {:?}",
+        String::from_utf8_lossy(&ok)
+    );
+
+    let replayed = seen.lock().await.clone();
+    let expected = BASE64.encode("\0bob@example.com\0right");
+    assert!(
+        find(&replayed, expected.as_bytes()).is_some(),
+        "the retry must be re-routed to bob's destination, backend saw {:?}",
+        String::from_utf8_lossy(&replayed)
+    );
+    assert_eq!(
+        rejects.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "alice's destination must see only the first attempt"
+    );
+
+    assert_eq!(
+        ctx.conns.kick(&ctx.router.normalize("alice@example.com")),
+        0,
+        "the failed account must not hold a registration"
+    );
+    assert_eq!(
+        ctx.conns.kick(&ctx.router.normalize("bob@example.com")),
+        1,
+        "the account that actually authenticated must be kickable"
+    );
+
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read(&mut [0u8; 64]),
+    )
+    .await
+    .expect("kick did not disconnect the client in time")
+    .unwrap();
+    assert_eq!(n, 0, "expected EOF after kick, got {n} bytes");
+
+    legacy.abort();
+    modern.abort();
+    let _ = handler.await;
+}

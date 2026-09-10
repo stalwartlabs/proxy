@@ -18,7 +18,7 @@ use crate::imap_receiver::Mechanism;
 use crate::net::BoxedStream;
 use crate::outbound;
 use crate::proto::common::{
-    self, Ctx, Handoff, assert_egress_encrypted, credential_from_sasl, mechanism_name,
+    self, Ctx, Handoff, assert_egress_encrypted, bump, credential_from_sasl, mechanism_name,
     plain_auth_allowed, write,
 };
 use crate::proto::forward;
@@ -32,73 +32,116 @@ struct SubmissionHandoff {
     ehlo_host: String,
 }
 
+struct SubmissionState {
+    buf: Vec<u8>,
+    auth_failures: u32,
+    ehlo_host: String,
+}
+
+impl Default for SubmissionState {
+    fn default() -> Self {
+        SubmissionState {
+            buf: Vec::with_capacity(1024),
+            auth_failures: 0,
+            ehlo_host: String::new(),
+        }
+    }
+}
+
 pub async fn handle_submission(
     ctx: &Ctx,
     listener: &ListenerConfig,
-    stream: BoxedStream,
+    mut stream: BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<()> {
     let caps = &ctx.config.capabilities.submission;
 
-    let sh = match timeout(
-        listener.preauth_timeout,
-        preauth(ctx, listener, caps, stream, local),
+    let hostname = ctx.config.server.hostname_for(local);
+    write(
+        &mut stream,
+        format!("220 {hostname} ESMTP {}\r\n", caps.banner).as_bytes(),
     )
-    .await
-    {
-        Ok(Ok(Some(h))) => h,
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()),
-    };
+    .await?;
 
-    let SubmissionHandoff { handoff, ehlo_host } = sh;
-    let Handoff {
-        stream,
-        mech,
-        raw_challenge,
-        identifier,
-        residual,
-    } = handoff;
+    let mut state = SubmissionState::default();
 
-    let identifier = ctx.routing_identifier(identifier);
-    let dest_id = ctx.resolve(identifier.as_deref()).await;
-    let started = std::time::Instant::now();
-    common::hold_login(ctx, identifier.as_deref()).await;
-    let fwd = forward::ForwardInfo::new(
-        peer,
-        local,
-        stream.is_tls(),
-        Some(ehlo_host),
-        ctx.config.server.proxy_ttl,
-    );
-
-    let auth = common::AuthFrame::inline(
-        format!(
-            "AUTH {} {}\r\n",
-            mechanism_name(&mech),
-            BASE64.encode(&raw_challenge)
+    loop {
+        let sh = match timeout(
+            listener.preauth_timeout,
+            preauth(ctx, listener, caps, stream, &hostname, &mut state),
         )
-        .into_bytes(),
-    );
+        .await
+        {
+            Ok(Ok(Some(h))) => h,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
 
-    common::bridge_authenticated(
-        ctx,
-        &dest_id,
-        stream,
-        peer,
-        identifier.as_deref(),
-        &residual,
-        started,
-        "submission",
-        common::AuthWire::Smtp,
-        &auth,
-        b"421 4.3.0 backend unavailable\r\n",
-        MAX_PREAUTH,
-        || open_backend(ctx, &dest_id, &fwd),
-    )
-    .await
+        let SubmissionHandoff {
+            handoff,
+            ehlo_host: announced,
+        } = sh;
+        let Handoff {
+            stream: client,
+            mech,
+            raw_challenge,
+            identifier,
+            residual,
+        } = handoff;
+
+        let identifier = ctx.routing_identifier(identifier);
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
+        let started = std::time::Instant::now();
+        common::hold_login(ctx, identifier.as_deref()).await;
+        let fwd = forward::ForwardInfo::new(
+            peer,
+            local,
+            client.is_tls(),
+            Some(announced),
+            ctx.config.server.proxy_ttl,
+        );
+
+        let auth = common::AuthFrame::inline(
+            format!(
+                "AUTH {} {}\r\n",
+                mechanism_name(&mech),
+                BASE64.encode(&raw_challenge)
+            )
+            .into_bytes(),
+        );
+
+        let resume = common::bridge_authenticated(
+            ctx,
+            &dest_id,
+            client,
+            peer,
+            identifier.as_deref(),
+            residual,
+            started,
+            "submission",
+            common::AuthWire::Smtp,
+            &auth,
+            b"421 4.3.0 backend unavailable\r\n",
+            MAX_PREAUTH,
+            || open_backend(ctx, &dest_id, &fwd),
+        )
+        .await?;
+
+        let Some(common::Resume {
+            stream: client,
+            buf,
+        }) = resume
+        else {
+            return Ok(());
+        };
+        if bump(&mut state.auth_failures, listener.max_auth_attempts) {
+            return Ok(());
+        }
+        stream = client;
+        state.buf = buf;
+    }
 }
 
 async fn preauth(
@@ -106,21 +149,17 @@ async fn preauth(
     listener: &ListenerConfig,
     caps: &SubmissionCapabilities,
     mut stream: BoxedStream,
-    local: SocketAddr,
+    hostname: &str,
+    state: &mut SubmissionState,
 ) -> Result<Option<SubmissionHandoff>> {
     let mut is_tls = stream.is_tls();
     let starttls_listener = listener.tls == TlsMode::Starttls;
-    let hostname = ctx.config.server.hostname_for(local);
 
-    write(
-        &mut stream,
-        format!("220 {hostname} ESMTP {}\r\n", caps.banner).as_bytes(),
-    )
-    .await?;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut ehlo_host = String::new();
-    let mut auth_failures = 0u32;
+    let SubmissionState {
+        buf,
+        auth_failures,
+        ehlo_host,
+    } = state;
 
     loop {
         let mut it = buf.iter();
@@ -133,10 +172,10 @@ async fn preauth(
                 let plain_ok = plain_auth_allowed(caps.allow_plain_auth_without_tls, is_tls);
                 match req {
                     Request::Ehlo { host } | Request::Lhlo { host } => {
-                        ehlo_host = host.to_string();
+                        *ehlo_host = host.to_string();
                         let resp = ehlo_response(
-                            &hostname,
-                            &ehlo_host,
+                            hostname,
+                            ehlo_host,
                             caps,
                             starttls_listener && !is_tls,
                             plain_ok,
@@ -145,7 +184,7 @@ async fn preauth(
                         buf.drain(..consumed);
                     }
                     Request::Helo { host } => {
-                        ehlo_host = host.to_string();
+                        *ehlo_host = host.to_string();
                         write(&mut stream, format!("250 {hostname}\r\n").as_bytes()).await?;
                         buf.drain(..consumed);
                     }
@@ -187,17 +226,17 @@ async fn preauth(
                             ctx,
                             plain_ok,
                             login_offered: common::sasl_offered(&caps.sasl, "LOGIN"),
-                            ehlo_host: &ehlo_host,
+                            ehlo_host,
                             max_attempts: listener.max_auth_attempts,
                         };
                         match handle_auth(
                             &params,
                             &mut stream,
-                            &mut buf,
+                            buf,
                             consumed,
                             mechanism,
                             &ir,
-                            &mut auth_failures,
+                            &mut *auth_failures,
                         )
                         .await?
                         {
@@ -233,7 +272,7 @@ async fn preauth(
                 if buf.len() > MAX_PREAUTH {
                     return Err(ProxyError::preauth("smtp line too long"));
                 }
-                let n = common::fill(&mut stream, &mut buf, MAX_PREAUTH + 8192).await?;
+                let n = common::fill(&mut stream, buf, MAX_PREAUTH + 8192).await?;
                 if n == 0 {
                     return Ok(None);
                 }
@@ -242,8 +281,7 @@ async fn preauth(
                 let drop_to = if consumed == 0 { buf.len() } else { consumed };
                 buf.drain(..drop_to);
                 write(&mut stream, b"500 5.5.2 Syntax error\r\n").await?;
-                auth_failures += 1;
-                if auth_failures >= listener.max_auth_attempts {
+                if bump(auth_failures, listener.max_auth_attempts) {
                     return Ok(None);
                 }
             }
@@ -448,8 +486,7 @@ async fn cancelled(
     max_attempts: u32,
 ) -> Result<AuthStep> {
     write(&mut *stream, b"501 5.7.0 Authentication cancelled\r\n").await?;
-    *auth_failures += 1;
-    if *auth_failures >= max_attempts {
+    if bump(auth_failures, max_attempts) {
         Ok(AuthStep::Close)
     } else {
         Ok(AuthStep::Continue)
@@ -468,8 +505,7 @@ async fn fail(
         buf.drain(..drain);
     }
     write(&mut *stream, format!("535 {message}\r\n").as_bytes()).await?;
-    *auth_failures += 1;
-    if *auth_failures >= max_attempts {
+    if bump(auth_failures, max_attempts) {
         Ok(AuthStep::Close)
     } else {
         Ok(AuthStep::Continue)

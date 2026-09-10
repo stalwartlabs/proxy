@@ -15,7 +15,7 @@ use crate::imap_receiver::Mechanism;
 use crate::net::BoxedStream;
 use crate::outbound;
 use crate::proto::common::{
-    self, Ctx, Handoff, assert_egress_encrypted, credential_from_sasl, mechanism_name,
+    self, Ctx, Handoff, assert_egress_encrypted, bump, credential_from_sasl, mechanism_name,
     plain_auth_allowed, write,
 };
 use crate::proto::forward;
@@ -27,69 +27,89 @@ const MAX_PREAUTH: usize = 64 * 1024;
 pub async fn handle(
     ctx: &Ctx,
     listener: &ListenerConfig,
-    stream: BoxedStream,
+    mut stream: BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<()> {
     let caps = &ctx.config.capabilities.pop3;
 
-    let handoff = match timeout(
-        listener.preauth_timeout,
-        preauth(ctx, listener, caps, stream),
-    )
-    .await
-    {
-        Ok(Ok(Some(h))) => h,
-        Ok(Ok(None)) => return Ok(()),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()),
-    };
+    write(&mut stream, format!("+OK {}\r\n", caps.banner).as_bytes()).await?;
 
-    let Handoff {
-        stream,
-        mech,
-        raw_challenge,
-        identifier,
-        residual,
-    } = handoff;
+    let mut seed = Vec::with_capacity(1024);
+    let mut auth_failures = 0u32;
 
-    let identifier = ctx.routing_identifier(identifier);
-    let dest_id = ctx.resolve(identifier.as_deref()).await;
-    let started = std::time::Instant::now();
-    common::hold_login(ctx, identifier.as_deref()).await;
-    let fwd = forward::ForwardInfo::new(
-        peer,
-        local,
-        stream.is_tls(),
-        None,
-        ctx.config.server.proxy_ttl,
-    );
-
-    let auth = common::AuthFrame::inline(
-        format!(
-            "AUTH {} {}\r\n",
-            mechanism_name(&mech),
-            BASE64.encode(&raw_challenge)
+    loop {
+        let handoff = match timeout(
+            listener.preauth_timeout,
+            preauth(ctx, listener, caps, stream, seed, &mut auth_failures),
         )
-        .into_bytes(),
-    );
+        .await
+        {
+            Ok(Ok(Some(h))) => h,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
 
-    common::bridge_authenticated(
-        ctx,
-        &dest_id,
-        stream,
-        peer,
-        identifier.as_deref(),
-        &residual,
-        started,
-        "pop3",
-        common::AuthWire::Pop3,
-        &auth,
-        b"-ERR backend unavailable\r\n",
-        MAX_PREAUTH,
-        || open_backend(ctx, &dest_id, &fwd),
-    )
-    .await
+        let Handoff {
+            stream: client,
+            mech,
+            raw_challenge,
+            identifier,
+            residual,
+        } = handoff;
+
+        let identifier = ctx.routing_identifier(identifier);
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
+        let started = std::time::Instant::now();
+        common::hold_login(ctx, identifier.as_deref()).await;
+        let fwd = forward::ForwardInfo::new(
+            peer,
+            local,
+            client.is_tls(),
+            None,
+            ctx.config.server.proxy_ttl,
+        );
+
+        let auth = common::AuthFrame::inline(
+            format!(
+                "AUTH {} {}\r\n",
+                mechanism_name(&mech),
+                BASE64.encode(&raw_challenge)
+            )
+            .into_bytes(),
+        );
+
+        let resume = common::bridge_authenticated(
+            ctx,
+            &dest_id,
+            client,
+            peer,
+            identifier.as_deref(),
+            residual,
+            started,
+            "pop3",
+            common::AuthWire::Pop3,
+            &auth,
+            b"-ERR backend unavailable\r\n",
+            MAX_PREAUTH,
+            || open_backend(ctx, &dest_id, &fwd),
+        )
+        .await?;
+
+        let Some(common::Resume {
+            stream: client,
+            buf,
+        }) = resume
+        else {
+            return Ok(());
+        };
+        if bump(&mut auth_failures, listener.max_auth_attempts) {
+            return Ok(());
+        }
+        stream = client;
+        seed = buf;
+    }
 }
 
 async fn preauth(
@@ -97,15 +117,14 @@ async fn preauth(
     listener: &ListenerConfig,
     caps: &Pop3Capabilities,
     mut stream: BoxedStream,
+    seed: Vec<u8>,
+    auth_failures: &mut u32,
 ) -> Result<Option<Handoff>> {
     let mut is_tls = stream.is_tls();
     let starttls_listener = listener.tls == TlsMode::Starttls;
 
-    write(&mut stream, format!("+OK {}\r\n", caps.banner).as_bytes()).await?;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut buf: Vec<u8> = seed;
     let mut pending_user: Option<Vec<u8>> = None;
-    let mut auth_failures = 0u32;
 
     loop {
         let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
@@ -227,7 +246,7 @@ async fn preauth(
                     _ => {
                         write(&mut stream, b"-ERR unsupported mechanism\r\n").await?;
                         buf.drain(..consumed);
-                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                        if bump(auth_failures, listener.max_auth_attempts) {
                             return Ok(None);
                         }
                         continue;
@@ -259,7 +278,7 @@ async fn preauth(
                     if common::sasl_cancelled(&user_b64) {
                         buf = rest;
                         write(&mut stream, b"-ERR authentication cancelled\r\n").await?;
-                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                        if bump(auth_failures, listener.max_auth_attempts) {
                             return Ok(None);
                         }
                         continue;
@@ -274,21 +293,21 @@ async fn preauth(
                     buf = rest;
                     if common::sasl_cancelled(&pass_b64) {
                         write(&mut stream, b"-ERR authentication cancelled\r\n").await?;
-                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                        if bump(auth_failures, listener.max_auth_attempts) {
                             return Ok(None);
                         }
                         continue;
                     }
                     let Some(raw) = common::login_challenge(&user_b64, &pass_b64) else {
                         write(&mut stream, b"-ERR invalid base64\r\n").await?;
-                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                        if bump(auth_failures, listener.max_auth_attempts) {
                             return Ok(None);
                         }
                         continue;
                     };
                     let Some(cred) = credential_from_sasl(&Mechanism::Plain, &raw) else {
                         write(&mut stream, b"-ERR malformed credentials\r\n").await?;
-                        if bump(&mut auth_failures, listener.max_auth_attempts) {
+                        if bump(auth_failures, listener.max_auth_attempts) {
                             return Ok(None);
                         }
                         continue;
@@ -321,14 +340,14 @@ async fn preauth(
 
                 let Some(raw) = decode_sasl_ir(&raw_b64) else {
                     write(&mut stream, b"-ERR invalid base64\r\n").await?;
-                    if bump(&mut auth_failures, listener.max_auth_attempts) {
+                    if bump(auth_failures, listener.max_auth_attempts) {
                         return Ok(None);
                     }
                     continue;
                 };
                 let Some(cred) = credential_from_sasl(&mech, &raw) else {
                     write(&mut stream, b"-ERR malformed credentials\r\n").await?;
-                    if bump(&mut auth_failures, listener.max_auth_attempts) {
+                    if bump(auth_failures, listener.max_auth_attempts) {
                         return Ok(None);
                     }
                     continue;
@@ -350,11 +369,6 @@ async fn preauth(
             }
         }
     }
-}
-
-fn bump(failures: &mut u32, max: u32) -> bool {
-    *failures += 1;
-    *failures >= max
 }
 
 fn split_verb(line: &[u8]) -> (&[u8], &[u8]) {

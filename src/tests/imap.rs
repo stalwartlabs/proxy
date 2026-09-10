@@ -801,3 +801,175 @@ async fn imap_keeps_inline_initial_response_when_backend_advertises_sasl_ir() {
     let _ = backend.await;
     handler.abort();
 }
+
+#[tokio::test]
+async fn imap_pipelined_command_after_failed_auth_is_parsed_not_bridged() {
+    let (port, backend) = dummy_backend(|mut sock| async move {
+        sock.write_all(b"* OK [CAPABILITY IMAP4rev2 SASL-IR] backend ready\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut scratch = [0u8; 1024];
+        while find(&buf, b"AUTHENTICATE").is_none() || find(&buf, b"\r\n").is_none() {
+            match sock.read(&mut scratch).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            }
+        }
+        let _ = sock
+            .write_all(b"a1 NO [AUTHENTICATIONFAILED] nope\r\n")
+            .await;
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    assert!(
+                        find(&sink[..n], b"CAPABILITY").is_none(),
+                        "pipelined client bytes must not reach the backend after a failed auth"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = config(port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40010".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(
+        &mut client,
+        b"a1 LOGIN user@example.com wrong\r\na2 CAPABILITY\r\n",
+    )
+    .await;
+
+    let seen = read_until(&mut client, b"a2 OK").await;
+    assert!(
+        find(&seen, b"a1 NO").is_some(),
+        "expected the backend rejection, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        find(&seen, b"a2 OK CAPABILITY completed").is_some(),
+        "the pipelined command must be answered by the proxy, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    drop(client);
+    let _ = backend.await;
+    let _ = handler.await;
+}
+
+async fn preauth_only_ctx() -> (
+    std::sync::Arc<crate::proto::common::Ctx>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (port, backend) = dummy_backend(|_sock| async move {}).await;
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = config(port, &mapping.path().display().to_string());
+    (make_ctx(&toml).await, backend)
+}
+
+#[tokio::test]
+async fn imap_rejected_sasl_response_is_not_reparsed_as_a_command() {
+    let (ctx, backend) = preauth_only_ctx().await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40011".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(
+        &mut client,
+        b"a1 AUTHENTICATE PLAIN\r\n@@@\r\na2 CAPABILITY\r\n",
+    )
+    .await;
+
+    let seen = read_until(&mut client, b"a2 OK").await;
+    assert!(
+        find(&seen, b"a1 NO").is_some(),
+        "expected the SASL response to be rejected, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        find(&seen, b"* BAD").is_none(),
+        "the rejected SASL response must not be re-parsed as a command, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        find(&seen, b"a2 OK CAPABILITY completed").is_some(),
+        "the pipelined command must still be answered, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    drop(client);
+    backend.abort();
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn imap_command_pipelined_behind_a_rejected_sasl_response_is_not_lost() {
+    let (ctx, backend) = preauth_only_ctx().await;
+    let listener = ctx.config.listener["imap"].clone();
+
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::imap::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40012".parse().unwrap(),
+            "127.0.0.1:143".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let _ = read_line(&mut client).await;
+    send(&mut client, b"a1 AUTHENTICATE PLAIN\r\n").await;
+    let challenge = read_until(&mut client, b"+ ").await;
+    assert!(find(&challenge, b"+ ").is_some(), "expected a continuation");
+
+    send(&mut client, b"@@@\r\na2 CAPABILITY\r\n").await;
+    let seen = read_until(&mut client, b"a2 OK").await;
+    assert!(
+        find(&seen, b"a1 NO").is_some(),
+        "expected the SASL response to be rejected, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        find(&seen, b"a2 OK CAPABILITY completed").is_some(),
+        "the command behind the rejected response must not be dropped, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    drop(client);
+    backend.abort();
+    let _ = handler.await;
+}

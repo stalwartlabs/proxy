@@ -190,7 +190,7 @@ pub async fn write_all(stream: &mut BoxedStream, bytes: &[u8]) -> Result<()> {
 
 const BRIDGE_BUF: usize = 16 * 1024;
 
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 pub async fn bridge(
     mut client: BoxedStream,
@@ -245,7 +245,7 @@ pub async fn bridge(
     }
 }
 
-async fn wait_kick(cancel: Option<tokio::sync::watch::Receiver<bool>>) {
+pub(crate) async fn wait_kick(cancel: Option<tokio::sync::watch::Receiver<bool>>) {
     match cancel {
         Some(mut rx) => {
             while rx.changed().await.is_ok() {

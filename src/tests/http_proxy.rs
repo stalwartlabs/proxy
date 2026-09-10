@@ -985,3 +985,364 @@ async fn http_chunked_request_and_response_round_trip() {
     let _ = backend.await;
     handler.abort();
 }
+
+fn extract_http_config(host: &str, port: u16, mapping_path: &str) -> String {
+    format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{mapping_path}"
+
+[routing]
+default_destination = "web"
+
+[destination.web]
+host = "{host}"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.web.protocol.http]
+port = {port}
+tls = "plain"
+
+[[http.route]]
+match = "/**"
+extract = {{ from = "authorization" }}
+
+[listener.http]
+protocol = "http"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#
+    )
+}
+
+#[tokio::test]
+async fn http_authenticated_keepalive_connection_is_kickable() {
+    async fn backend(mut sock: tokio::net::TcpStream) {
+        read_req_head(&mut sock).await;
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    let (port, backend) = dummy_backend(backend).await;
+    let mapping = mapping_file("user@example.com\tweb\n");
+    let toml = extract_http_config("127.0.0.1", port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40070".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let creds = BASE64.encode("user@example.com:pw");
+    let req = format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\n\r\n");
+    send(&mut client, req.as_bytes()).await;
+    let resp = read_until(&mut client, b"ok").await;
+    assert!(find(&resp, b"200").is_some(), "expected 200");
+
+    assert_eq!(
+        ctx.conns.kick(&ctx.router.normalize("user@example.com")),
+        1,
+        "an authenticated http connection must be registered for its account"
+    );
+
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read(&mut [0u8; 64]),
+    )
+    .await
+    .expect("kick did not disconnect the client in time")
+    .unwrap();
+    assert_eq!(n, 0, "expected EOF after kick, got {n} bytes");
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn http_websocket_bridge_is_kickable() {
+    async fn backend(mut sock: tokio::net::TcpStream) {
+        read_req_head(&mut sock).await;
+        sock.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    let (port, backend) = dummy_backend(backend).await;
+    let mapping = mapping_file("user@example.com\tweb\n");
+    let toml = extract_http_config("127.0.0.1", port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40071".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let creds = BASE64.encode("user@example.com:pw");
+    let req = format!(
+        "GET /ws HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    send(&mut client, req.as_bytes()).await;
+
+    let upgrade = read_until(&mut client, b"\r\n\r\n").await;
+    assert!(find(&upgrade, b"101").is_some(), "expected the 101 upgrade");
+
+    assert_eq!(
+        ctx.conns.kick(&ctx.router.normalize("user@example.com")),
+        1,
+        "an upgraded websocket must stay registered for its account"
+    );
+
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read(&mut [0u8; 64]),
+    )
+    .await
+    .expect("kick did not disconnect the websocket in time")
+    .unwrap();
+    assert_eq!(n, 0, "expected EOF after kick, got {n} bytes");
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn http_keepalive_rejects_a_second_account_with_421() {
+    async fn backend(mut sock: tokio::net::TcpStream) {
+        for _ in 0..2 {
+            read_req_head(&mut sock).await;
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    let (port, backend) = dummy_backend(backend).await;
+    let mapping = mapping_file("user@example.com\tweb\nother@example.com\tweb\n");
+    let toml = extract_http_config("127.0.0.1", port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40072".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let first = BASE64.encode("user@example.com:pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {first}\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let resp = read_until(&mut client, b"ok").await;
+    assert!(
+        find(&resp, b"200").is_some(),
+        "expected 200 for the pinned account"
+    );
+
+    let second = BASE64.encode("other@example.com:pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {second}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await;
+    let tail = read_to_eof(&mut client).await;
+    assert!(
+        find(&tail, b"421").is_some(),
+        "a second account on a pinned connection must get 421, got {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn http_empty_identifier_does_not_pin_or_register_the_connection() {
+    async fn backend(mut sock: tokio::net::TcpStream) {
+        for _ in 0..2 {
+            read_req_head(&mut sock).await;
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    let (port, backend) = dummy_backend(backend).await;
+    let mapping = mapping_file("user@example.com\tweb\n");
+    let toml = extract_http_config("127.0.0.1", port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40073".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let empty = BASE64.encode(":pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {empty}\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let first = read_until(&mut client, b"ok").await;
+    assert!(
+        find(&first, b"200").is_some(),
+        "expected 200 for the empty login"
+    );
+
+    assert_eq!(
+        ctx.conns.kick(""),
+        0,
+        "an empty identifier must not be registered as an account"
+    );
+
+    let creds = BASE64.encode("user@example.com:pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let second = read_until(&mut client, b"ok").await;
+    assert!(
+        find(&second, b"421").is_none(),
+        "an empty first login must not pin the connection, got {:?}",
+        String::from_utf8_lossy(&second)
+    );
+    assert_eq!(
+        ctx.conns.kick(&ctx.router.normalize("user@example.com")),
+        1,
+        "the real account must be the one registered"
+    );
+
+    let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn http_login_delay_holds_an_authenticated_request() {
+    async fn backend(mut sock: tokio::net::TcpStream) {
+        read_req_head(&mut sock).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+    }
+
+    let (port, backend) = dummy_backend(backend).await;
+    let mapping = mapping_file("user@example.com\tweb\n");
+    let toml = extract_http_config("127.0.0.1", port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+
+    ctx.conns.set_delay(
+        &ctx.router.normalize("user@example.com"),
+        std::time::Instant::now() + std::time::Duration::from_millis(1500),
+    );
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40075".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let started = std::time::Instant::now();
+    let creds = BASE64.encode("user@example.com:pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let resp = read_to_eof(&mut client).await;
+    assert!(find(&resp, b"200").is_some(), "expected 200");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1400),
+        "the login delay must hold an http request too, elapsed {:?}",
+        started.elapsed()
+    );
+
+    let _ = backend.await;
+    handler.abort();
+}
