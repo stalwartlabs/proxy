@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use encodify::base64::STANDARD as B64;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -34,11 +35,9 @@ impl Response {
 }
 
 pub fn basic_auth(user: &str, pass: &str) -> String {
-    use base64::Engine;
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
-    )
+    let mut header = String::from("Basic ");
+    B64.encode_append(format!("{user}:{pass}"), &mut header);
+    header
 }
 
 pub async fn upgrade(

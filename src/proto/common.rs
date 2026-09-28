@@ -23,7 +23,7 @@ use crate::error::{ProxyError, Result};
 use crate::imap_receiver::Mechanism;
 use crate::net::BoxedStream;
 use crate::net::tls;
-use crate::sasl::Credential;
+use crate::sasl::{Credential, SASL_RESPONSE};
 
 pub struct Handoff {
     pub stream: BoxedStream,
@@ -133,13 +133,15 @@ pub fn sasl_cancelled(response: &[u8]) -> bool {
 }
 
 pub fn login_challenge(username_b64: &[u8], password_b64: &[u8]) -> Option<Vec<u8>> {
-    let username = crate::sasl::decode_sasl_ir(username_b64)?;
-    let password = crate::sasl::decode_sasl_ir(password_b64)?;
-    let mut raw = Vec::with_capacity(username.len() + password.len() + 2);
+    let mut raw = Vec::with_capacity(
+        SASL_RESPONSE.decoded_len_estimate(username_b64.len())
+            + SASL_RESPONSE.decoded_len_estimate(password_b64.len())
+            + 2,
+    );
     raw.push(0);
-    raw.extend_from_slice(&username);
+    SASL_RESPONSE.decode_append(username_b64, &mut raw).ok()?;
     raw.push(0);
-    raw.extend_from_slice(&password);
+    SASL_RESPONSE.decode_append(password_b64, &mut raw).ok()?;
     Some(raw)
 }
 
@@ -1114,7 +1116,7 @@ mod tests {
 
     #[test]
     fn login_challenge_builds_a_plain_authentication_frame() {
-        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        use encodify::base64::STANDARD as BASE64;
         let user = BASE64.encode("user@example.com");
         let pass = BASE64.encode("secret");
         assert_eq!(

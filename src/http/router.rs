@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use encodify::base64::STANDARD as BASE64;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 
@@ -144,8 +144,7 @@ impl HttpRouter {
         let value = head.header("authorization")?;
         let value = value.trim();
         if let Some(rest) = strip_scheme(value, "basic") {
-            let decoded = BASE64.decode(rest.trim()).ok()?;
-            let text = String::from_utf8(decoded).ok()?;
+            let text = BASE64.decode_to_string(rest.trim()).ok()?;
             let login = match text.split_once(':') {
                 Some((login, _)) => login,
                 None => text.as_str(),
@@ -359,7 +358,7 @@ extract = { from = "authorization" }
 
     #[test]
     fn bearer_uses_bearer_identifier() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use encodify::base64::URL_SAFE_NO_PAD;
         let router = router_from_toml(
             r#"
 [[route]]

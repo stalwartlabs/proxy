@@ -4,17 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use encodify::base64::URL_SAFE_NO_PAD;
 
 use crate::sasl::Credential;
 
 pub fn bearer_identifier(token: &str, jwt_username_claim: &str) -> Option<String> {
     if let Some(rest) = token.strip_prefix("sw1.") {
         return match rest.split_once('.') {
-            Some((_body, footer)) => {
-                let decoded = URL_SAFE_NO_PAD.decode(footer).ok()?;
-                String::from_utf8(decoded).ok()
-            }
+            Some((_body, footer)) => URL_SAFE_NO_PAD.decode_to_string(footer).ok(),
             None => None,
         };
     }
@@ -61,7 +58,6 @@ pub fn identifier_from_credential(cred: &Credential, jwt_username_claim: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     #[test]
     fn sw1_footer() {

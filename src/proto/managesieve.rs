@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use encodify::base64::STANDARD as BASE64;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
@@ -20,7 +20,7 @@ use crate::proto::common::{
     plain_auth_allowed, write,
 };
 use crate::proto::forward;
-use crate::sasl::decode_sasl_ir;
+use crate::sasl::SASL_RESPONSE;
 use crate::token::identifier_from_credential;
 
 const MAX_PREAUTH: usize = 64 * 1024;
@@ -81,14 +81,10 @@ pub async fn handle(
             ctx.config.server.proxy_ttl,
         );
 
-        let auth = common::AuthFrame::inline(
-            format!(
-                "AUTHENTICATE \"{}\" \"{}\"\r\n",
-                mechanism_name(&mech),
-                BASE64.encode(&raw_challenge)
-            )
-            .into_bytes(),
-        );
+        let mut frame = format!("AUTHENTICATE \"{}\" \"", mechanism_name(&mech));
+        BASE64.encode_append(&raw_challenge, &mut frame);
+        frame.push_str("\"\r\n");
+        let auth = common::AuthFrame::inline(frame.into_bytes());
 
         let resume = common::bridge_authenticated(
             ctx,
@@ -333,7 +329,7 @@ async fn handle_authenticate(
         read_sasl_response(stream, seed).await?
     };
 
-    let Some(raw) = decode_sasl_ir(&raw_b64) else {
+    let Ok(raw) = SASL_RESPONSE.decode(&raw_b64) else {
         return fail(
             stream,
             "Invalid base64",

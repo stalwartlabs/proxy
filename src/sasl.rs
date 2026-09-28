@@ -4,6 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use encodify::base64::{self, Base64};
+
+pub const SASL_RESPONSE: Base64 = base64::LENIENT;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credential {
     Plain {
@@ -98,10 +102,6 @@ pub fn extract_oauth_bearer(bytes: &[u8]) -> Option<(String, Option<String>)> {
     None
 }
 
-pub fn decode_sasl_ir(b64: &[u8]) -> Option<Vec<u8>> {
-    mail_parser::decoders::base64::base64_decode(b64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn lenient_ir_decode() {
-        let out = decode_sasl_ir(b"dGVzdAB0ZXN0AHRlc3Q=").unwrap();
+        let out = SASL_RESPONSE.decode(b"dGVzdAB0ZXN0AHRlc3Q=").unwrap();
         assert_eq!(out, b"test\0test\0test");
     }
 
@@ -204,13 +204,13 @@ mod tests {
 
     #[test]
     fn lenient_ir_tolerates_whitespace() {
-        let with_ws = decode_sasl_ir(b"dGVz dAB0\nZXN0AHRlc3Q=").unwrap();
+        let with_ws = SASL_RESPONSE.decode(b"dGVz dAB0\nZXN0AHRlc3Q=").unwrap();
         assert_eq!(with_ws, b"test\0test\0test");
     }
 
     #[test]
     fn lenient_ir_decodes_full_quads_without_padding() {
-        let out = decode_sasl_ir(b"AHRlc3QAc2VjcmV0").unwrap();
+        let out = SASL_RESPONSE.decode(b"AHRlc3QAc2VjcmV0").unwrap();
         assert_eq!(out, b"\0test\0secret");
     }
 }

@@ -830,7 +830,7 @@ fn path_of(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
+    use encodify::base64::STANDARD as B64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn imaps_auth(host: &str, port: u16, login: &str, password: &str) -> String {
@@ -838,7 +838,7 @@ mod tests {
         let mut stream = crate::tests::harness::tls_connect_client(tcp).await;
         let mut buf = [0u8; 512];
         let _ = stream.read(&mut buf).await.unwrap();
-        let ir = base64::engine::general_purpose::STANDARD.encode(format!("\0{login}\0{password}"));
+        let ir = B64.encode(format!("\0{login}\0{password}"));
         stream
             .write_all(format!("a1 AUTHENTICATE PLAIN {ir}\r\n").as_bytes())
             .await

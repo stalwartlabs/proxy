@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use encodify::base64::STANDARD as BASE64;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
@@ -19,7 +19,7 @@ use crate::proto::common::{
     self, Ctx, assert_egress_encrypted, mechanism_name, plain_auth_allowed, read_crlf_line, write,
 };
 use crate::proto::forward;
-use crate::sasl::decode_sasl_ir;
+use crate::sasl::SASL_RESPONSE;
 use crate::token::identifier_from_credential;
 
 const MAX_PREAUTH: usize = 64 * 1024;
@@ -93,13 +93,15 @@ pub async fn handle(
             forward::ForwardInfo::new(peer, local, client_tls, None, ctx.config.server.proxy_ttl);
 
         let mech_name = mechanism_name(&mech);
-        let response = BASE64.encode(&raw_challenge);
+        let mut response = String::with_capacity(BASE64.encoded_len(raw_challenge.len()) + 2);
+        BASE64.encode_append(&raw_challenge, &mut response);
+        response.push_str("\r\n");
         let auth = common::AuthFrame::inline(
-            format!("{tag} AUTHENTICATE {mech_name} {response}\r\n").into_bytes(),
+            format!("{tag} AUTHENTICATE {mech_name} {response}").into_bytes(),
         )
         .with_deferred(
             format!("{tag} AUTHENTICATE {mech_name}\r\n").into_bytes(),
-            format!("{response}\r\n").into_bytes(),
+            response.into_bytes(),
         );
         let unavailable = format!("{tag} NO [UNAVAILABLE] backend unavailable\r\n");
 
@@ -404,7 +406,7 @@ impl Auth<'_> {
             read_crlf_line(stream, seed, MAX_PREAUTH).await?
         };
 
-        let Some(raw) = decode_sasl_ir(&raw_b64) else {
+        let Ok(raw) = SASL_RESPONSE.decode(&raw_b64) else {
             return self
                 .reject(
                     stream,

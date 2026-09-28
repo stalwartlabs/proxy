@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use encodify::base64::STANDARD as BASE64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
