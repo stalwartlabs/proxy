@@ -324,6 +324,14 @@ async fn admin_delay_holds_new_login() {
     )
     .await;
     assert_eq!(status, 400);
+    let (status, _) = admin_request(
+        admin_addr,
+        "POST",
+        "/connections/delay?identifier=user@example.com&seconds=18446744073709551615",
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, 400);
 
     let listener = ctx.config.listener["pop3"].clone();
     let (mut client, server) = tcp_pair().await;
@@ -644,4 +652,165 @@ async fn admin_config_reload_rejects_invalid() {
         &*shared.load().router.resolve(Some("y@example.com")).await,
         "legacy"
     );
+}
+
+fn switch_config(old_port: u16, new_port: u16, mapping_path: &str) -> String {
+    format!(
+        r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{mapping_path}"
+
+[capabilities.pop3]
+allow_plain_auth_without_tls = true
+
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+forwarding = "none"
+allow_plaintext_auth = true
+[destination.legacy.protocol.pop3]
+port = {old_port}
+tls = "plain"
+
+[destination.next]
+host = "127.0.0.1"
+forwarding = "none"
+allow_plaintext_auth = true
+[destination.next.protocol.pop3]
+port = {new_port}
+tls = "plain"
+
+[listener.pop3]
+protocol = "pop3"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+
+[admin]
+bind = "127.0.0.1:0"
+tls = "implicit"
+bearer_token = "{TOKEN}"
+min_token_len = 32
+lockout_threshold = 100
+lockout_duration = "5m"
+"#
+    )
+}
+
+async fn pop3_named_backend(name: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    dummy_backend(move |mut sock| async move {
+        sock.write_all(b"+OK ready\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        let mut scratch = [0u8; 1024];
+        while find(&buf, b"AUTH PLAIN").is_none() || find(&buf, b"\r\n").is_none() {
+            let n = sock.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&scratch[..n]);
+        }
+        sock.write_all(format!("+OK logged in at {name}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let _ = sock.read(&mut scratch).await;
+    })
+    .await
+}
+
+async fn held_login_follows_mapping_change(method: &str, path: &str, mapping_update: Option<&str>) {
+    use tokio::io::AsyncReadExt;
+
+    let (old_port, old_backend) = pop3_named_backend("legacy").await;
+    let (new_port, new_backend) = pop3_named_backend("next").await;
+    let mapping = mapping_file("user@example.com\tlegacy\n");
+    let toml = switch_config(old_port, new_port, &mapping.path().display().to_string());
+    let ctx = make_ctx(&toml).await;
+
+    let admin_listener = TcpListener::bind(unused_addr()).await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    let admin_ctx = ctx.clone();
+    let admin_config = ctx.config.clone();
+    tokio::spawn(async move {
+        let shared = std::sync::Arc::new(arc_swap::ArcSwap::new(admin_ctx));
+        let _ = crate::admin::serve(shared, admin_config, None, admin_listener).await;
+    });
+
+    let (status, _) = admin_request(
+        admin_addr,
+        "POST",
+        "/connections/delay?identifier=user@example.com&seconds=60",
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let listener = ctx.config.listener["pop3"].clone();
+    let (mut client, server) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::proto::pop3::handle(
+            &ctx2,
+            &listener,
+            Box::new(server),
+            "203.0.113.9:40000".parse().unwrap(),
+            "127.0.0.1:110".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let greeting = read_line(&mut client).await;
+    assert!(greeting.starts_with("+OK"), "greeting: {greeting}");
+    send(&mut client, b"USER user@example.com\r\nPASS secret\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    if let Some(contents) = mapping_update {
+        std::fs::write(mapping.path(), contents).unwrap();
+    }
+    let (status, _) = admin_request(admin_addr, method, path, Some(TOKEN)).await;
+    assert_eq!(status, 200);
+
+    let mut seen = Vec::new();
+    let mut scratch = [0u8; 1024];
+    while find(&seen, b"+OK logged in at").is_none() {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut scratch))
+            .await
+            .expect("held login was not released by the mapping change")
+            .unwrap();
+        assert!(n > 0, "client closed before login");
+        seen.extend_from_slice(&scratch[..n]);
+    }
+    assert!(
+        find(&seen, b"+OK logged in at next").is_some(),
+        "held login must reach the new destination, got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    drop(client);
+    let _ = new_backend.await;
+    old_backend.abort();
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn admin_mapping_put_releases_held_login_to_new_destination() {
+    // a login held by /connections/delay goes to the destination set by PUT /mappings at once
+    held_login_follows_mapping_change(
+        "PUT",
+        "/mappings?identifier=user@example.com&destination=next",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn admin_mappings_reload_releases_held_login_to_new_destination() {
+    // a login held by /connections/delay goes to the destination loaded by /mappings/reload at once
+    held_login_follows_mapping_change("POST", "/mappings/reload", Some("user@example.com\tnext\n"))
+        .await;
 }

@@ -516,6 +516,113 @@ tls = "plain"
     handler.abort();
 }
 
+#[tokio::test]
+async fn http_route_fallback_destination_used_without_mapping() {
+    async fn backend_default(mut sock: tokio::net::TcpStream) {
+        read_req_head(&mut sock).await;
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndefault")
+            .await
+            .unwrap();
+    }
+    async fn backend_fallback(mut sock: tokio::net::TcpStream) {
+        read_req_head(&mut sock).await;
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfallback",
+        )
+        .await
+        .unwrap();
+    }
+
+    let mapping = mapping_file("alice@x\tweb_default\n");
+    let mut handles = Vec::new();
+    let cases = [
+        (None, "fallback"),
+        (Some("nobody@x"), "fallback"),
+        (Some("alice@x"), "default"),
+    ];
+    for (user, expected) in cases {
+        let (port_d, bd) = dummy_backend(backend_default).await;
+        let (port_f, bf) = dummy_backend(backend_fallback).await;
+        handles.push(bd);
+        handles.push(bf);
+        let toml = format!(
+            r#"
+[mapping]
+source = "file"
+normalize = "lowercase"
+[mapping.file]
+path = "{}"
+
+[routing]
+default_destination = "web_default"
+
+[destination.web_default]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.web_default.protocol.http]
+port = {port_d}
+tls = "plain"
+
+[destination.web_fallback]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.web_fallback.protocol.http]
+port = {port_f}
+tls = "plain"
+
+[[http.route]]
+match = "/**"
+extract = {{ from = "authorization" }}
+fallback = "web_fallback"
+
+[listener.http]
+protocol = "http"
+bind = ["127.0.0.1:0"]
+tls = "plain"
+"#,
+            mapping.path().display()
+        );
+        let ctx = make_ctx(&toml).await;
+        let listener = ctx.config.listener["http"].clone();
+        let (mut client, srv) = tcp_pair().await;
+        let handler = tokio::spawn(async move {
+            let _ = crate::http::proxy::handle(
+                &ctx,
+                &listener,
+                Box::new(srv),
+                "127.0.0.1:40044".parse().unwrap(),
+                "127.0.0.1:80".parse().unwrap(),
+            )
+            .await;
+        });
+        let auth = user
+            .map(|u| {
+                format!(
+                    "Authorization: Basic {}\r\n",
+                    BASE64.encode(format!("{u}:pw"))
+                )
+            })
+            .unwrap_or_default();
+        send(
+            &mut client,
+            format!("GET / HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n").as_bytes(),
+        )
+        .await;
+        let resp = read_to_eof(&mut client).await;
+        assert!(
+            resp.ends_with(expected.as_bytes()),
+            "user {user:?} should reach {expected}, got {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        handles.push(handler);
+    }
+    for h in handles {
+        h.abort();
+    }
+}
+
 async fn read_until_backend(sock: &mut tokio::net::TcpStream, needle: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
@@ -1344,5 +1451,84 @@ async fn http_login_delay_holds_an_authenticated_request() {
     );
 
     let _ = backend.await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn http_held_login_follows_mapping_change() {
+    // an http request held by a login delay is sent to the destination mapped when the hold ends
+    async fn backend(name: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+        dummy_backend(move |mut sock| async move {
+            read_req_head(&mut sock).await;
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{name}",
+                        name.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        })
+        .await
+    }
+
+    let (old_port, old_backend) = backend("legacy").await;
+    let (new_port, new_backend) = backend("next").await;
+    let mapping = mapping_file("user@example.com\tweb\n");
+    let toml = format!(
+        r#"{}
+[destination.next]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.next.protocol.http]
+port = {new_port}
+tls = "plain"
+"#,
+        extract_http_config("127.0.0.1", old_port, &mapping.path().display().to_string())
+    );
+    let ctx = make_ctx(&toml).await;
+    let listener = ctx.config.listener["http"].clone();
+    let identifier = ctx.router.normalize("user@example.com");
+    ctx.conns.set_delay(
+        &identifier,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    );
+
+    let (mut client, srv) = tcp_pair().await;
+    let ctx2 = ctx.clone();
+    let handler = tokio::spawn(async move {
+        let _ = crate::http::proxy::handle(
+            &ctx2,
+            &listener,
+            Box::new(srv),
+            "127.0.0.1:40076".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        )
+        .await;
+    });
+
+    let creds = BASE64.encode("user@example.com:pw");
+    send(
+        &mut client,
+        format!("GET /jmap HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    ctx.router.upsert("user@example.com", "next").await.unwrap();
+    ctx.conns.release_delay(&identifier);
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), read_to_eof(&mut client))
+        .await
+        .expect("held request was not released by the mapping change");
+    assert!(
+        find(&resp, b"\r\n\r\nnext").is_some(),
+        "held request must reach the new destination, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = new_backend.await;
+    old_backend.abort();
     handler.abort();
 }

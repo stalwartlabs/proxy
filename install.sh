@@ -318,7 +318,7 @@ destination = "legacy"
 [[http.route]]
 match = "/**"
 extract = { from = "authorization" }
-fallback = "default"
+fallback = "legacy"
 
 [admin]
 bind = "127.0.0.1:9443"

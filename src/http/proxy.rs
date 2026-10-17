@@ -5,6 +5,7 @@
  */
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -521,11 +522,7 @@ async fn serve(
     let mut first_head = first_head;
     sanitize_inbound_forwarded(&mut first_head, listener);
 
-    let Prepared {
-        body: buffered_body,
-        dest_id,
-        identifier,
-    } = match prepare(
+    let prepared = match prepare(
         ctx,
         router,
         stream,
@@ -544,9 +541,11 @@ async fn serve(
     };
 
     let mut account = Account::new(cancel);
-    if account.pin(ctx, identifier.as_deref()) {
-        crate::proto::common::hold_login(ctx, identifier.as_deref()).await;
+    if account.pin(ctx, prepared.identifier.as_deref()) {
+        crate::proto::common::hold_login(ctx, prepared.identifier.as_deref()).await;
     }
+    let dest_id = prepared.destination(ctx).await;
+    let buffered_body = prepared.body;
 
     let (dest, ep, tls_cfg) = match ctx.endpoint(&dest_id, Protocol::Http) {
         Ok(t) => t,
@@ -648,11 +647,7 @@ async fn serve(
         let mut next = next;
         sanitize_inbound_forwarded(&mut next, listener);
 
-        let Prepared {
-            body: next_body,
-            dest_id: next_dest,
-            identifier: next_identifier,
-        } = match prepare(
+        let prepared = match prepare(
             ctx,
             router,
             stream,
@@ -670,7 +665,14 @@ async fn serve(
             }
         };
 
-        if next_dest != dest_id || !account.accepts(ctx, next_identifier.as_deref()) {
+        let misdirected = !account.accepts(ctx, prepared.identifier.as_deref()) || {
+            if account.pin(ctx, prepared.identifier.as_deref()) {
+                crate::proto::common::hold_login(ctx, prepared.identifier.as_deref()).await;
+            }
+            prepared.destination(ctx).await != dest_id
+        };
+        let next_body = prepared.body;
+        if misdirected {
             if let Some(body) = &next_body {
                 drain_buffered(stream, &mut reader, &next, body.len(), idle.body)
                     .await
@@ -678,9 +680,6 @@ async fn serve(
             }
             let _ = write_client(stream, &error_response(421, "Misdirected Request")).await;
             return Ok(Disposition::Close);
-        }
-        if account.pin(ctx, next_identifier.as_deref()) {
-            crate::proto::common::hold_login(ctx, next_identifier.as_deref()).await;
         }
 
         current_head = next;
@@ -970,10 +969,32 @@ async fn drain_buffered(
     Ok(())
 }
 
+enum Target {
+    Pinned(String),
+    Account { fallback: Option<Arc<str>> },
+}
+
 struct Prepared {
     body: Option<Vec<u8>>,
-    dest_id: String,
+    target: Target,
     identifier: Option<String>,
+}
+
+impl Prepared {
+    async fn destination(&self, ctx: &Ctx) -> String {
+        match &self.target {
+            Target::Pinned(dest_id) => dest_id.clone(),
+            Target::Account {
+                fallback: Some(fallback),
+            } => ctx
+                .resolve_or(self.identifier.as_deref(), fallback)
+                .await
+                .to_string(),
+            Target::Account { fallback: None } => {
+                ctx.resolve(self.identifier.as_deref()).await.to_string()
+            }
+        }
+    }
 }
 
 async fn prepare(
@@ -1000,25 +1021,20 @@ async fn prepare(
         None
     };
 
-    let (dest_id, identifier) = match router.route_at(idx, head, body.as_deref()) {
-        RouteOutcome::Pin { dest_id } => (dest_id, None),
+    let (target, identifier) = match router.route_at(idx, head, body.as_deref()) {
+        RouteOutcome::Pin { dest_id } => (Target::Pinned(dest_id), None),
         RouteOutcome::Identifier {
             identifier,
             fallback,
-        } => {
-            let identifier = ctx.routing_identifier(identifier);
-            let dest_id = if identifier.is_none() && fallback.is_none() {
-                ctx.resolve(None).await.to_string()
-            } else {
-                ctx.resolve(identifier.as_deref()).await.to_string()
-            };
-            (dest_id, identifier)
-        }
+        } => (
+            Target::Account { fallback },
+            ctx.routing_identifier(identifier),
+        ),
     };
 
     Ok(Some(Prepared {
         body,
-        dest_id,
+        target,
         identifier,
     }))
 }

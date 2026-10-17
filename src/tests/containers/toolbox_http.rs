@@ -40,7 +40,7 @@ tls = "implicit"
 [[http.route]]
 match = "/**"
 extract = {{ from = "authorization" }}
-fallback = "default"
+fallback = "new"
 
 [listener.http]
 protocol = "http"

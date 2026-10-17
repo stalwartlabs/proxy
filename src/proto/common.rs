@@ -295,16 +295,22 @@ pub struct HealthSnapshot {
 }
 
 const REGISTRY_SHARDS: usize = 32;
+const MAX_LOGIN_HOLD: Duration = Duration::from_secs(120);
 
 struct LiveConn {
     id: u64,
     cancel: tokio::sync::watch::Sender<bool>,
 }
 
+struct LoginDelay {
+    until: Instant,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
 #[derive(Default)]
 struct Shard {
     live: HashMap<Arc<str>, Vec<LiveConn>>,
-    delays: HashMap<Arc<str>, Instant>,
+    delays: HashMap<Arc<str>, LoginDelay>,
 }
 
 #[derive(Clone)]
@@ -398,20 +404,63 @@ impl ConnRegistry {
     pub fn set_delay(&self, identifier: &str, until: Instant) {
         let mut shard = self.shards[self.shard_idx(identifier)].lock();
         let now = Instant::now();
-        shard.delays.retain(|_, &mut u| u > now);
-        shard.delays.insert(Arc::from(identifier), until);
+        shard.delays.retain(|_, delay| delay.until > now);
+        match shard.delays.get_mut(identifier) {
+            Some(delay) => {
+                delay.until = until;
+                delay.changed.send_replace(());
+            }
+            None => {
+                shard.delays.insert(
+                    Arc::from(identifier),
+                    LoginDelay {
+                        until,
+                        changed: tokio::sync::watch::Sender::new(()),
+                    },
+                );
+            }
+        }
     }
 
-    pub fn delay_remaining(&self, identifier: &str) -> Option<Duration> {
+    fn delay(&self, identifier: &str) -> Option<(Instant, tokio::sync::watch::Receiver<()>)> {
         let mut shard = self.shards[self.shard_idx(identifier)].lock();
-        if let Some(&until) = shard.delays.get(identifier) {
-            let now = Instant::now();
-            if now < until {
-                return Some(until - now);
-            }
-            shard.delays.remove(identifier);
+        let delay = shard.delays.get(identifier)?;
+        if Instant::now() < delay.until {
+            return Some((delay.until, delay.changed.subscribe()));
         }
+        shard.delays.remove(identifier);
         None
+    }
+
+    pub fn release_delay(&self, identifier: &str) {
+        self.shards[self.shard_idx(identifier)]
+            .lock()
+            .delays
+            .remove(identifier);
+    }
+
+    pub fn release_all_delays(&self) {
+        for shard in self.shards.iter() {
+            shard.lock().delays.clear();
+        }
+    }
+
+    pub async fn hold_login(&self, identifier: &str) {
+        let deadline = Instant::now() + MAX_LOGIN_HOLD;
+        while let Some((until, mut changed)) = self.delay(identifier) {
+            let wake = until.min(deadline);
+            if Instant::now() >= wake {
+                break;
+            }
+            tracing::debug!(
+                hold_ms = wake.saturating_duration_since(Instant::now()).as_millis() as u64,
+                "holding login (delay_until)"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake.into()) => {}
+                _ = changed.changed() => {}
+            }
+        }
     }
 }
 
@@ -545,6 +594,10 @@ impl Ctx {
         self.router.resolve(identifier).await
     }
 
+    pub async fn resolve_or(&self, identifier: Option<&str>, default: &Arc<str>) -> Arc<str> {
+        self.router.resolve_or(identifier, default).await
+    }
+
     pub fn register_conn(&self, identifier: &str) -> ConnGuard {
         self.conns.register(&self.router.normalize(identifier))
     }
@@ -657,15 +710,8 @@ where
 }
 
 pub async fn hold_login(ctx: &Ctx, identifier: Option<&str>) {
-    if let Some(id) = identifier
-        && let Some(remaining) = ctx.conns.delay_remaining(&ctx.router.normalize(id))
-    {
-        let capped = remaining.min(Duration::from_secs(120));
-        tracing::debug!(
-            hold_ms = capped.as_millis() as u64,
-            "holding login (delay_until)"
-        );
-        tokio::time::sleep(capped).await;
+    if let Some(id) = identifier {
+        ctx.conns.hold_login(&ctx.router.normalize(id)).await;
     }
 }
 
@@ -1367,14 +1413,86 @@ mod tests {
         assert_eq!(reg.kick("user@example.com"), 0);
     }
 
+    #[tokio::test]
+    async fn conn_registry_release_ends_hold() {
+        // releasing a delay wakes a held login immediately
+        let reg = ConnRegistry::default();
+        reg.set_delay("user@example.com", Instant::now() + Duration::from_secs(60));
+        let held = reg.clone();
+        let hold = tokio::spawn(async move { held.hold_login("user@example.com").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!hold.is_finished());
+        reg.release_delay("user@example.com");
+        tokio::time::timeout(Duration::from_secs(2), hold)
+            .await
+            .expect("release did not end the hold")
+            .unwrap();
+        assert!(reg.delay("user@example.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn conn_registry_release_all_ends_holds() {
+        // releasing every delay wakes all held logins
+        let reg = ConnRegistry::default();
+        let until = Instant::now() + Duration::from_secs(60);
+        reg.set_delay("a@example.com", until);
+        reg.set_delay("b@example.com", until);
+        let holds = ["a@example.com", "b@example.com"].map(|id| {
+            let held = reg.clone();
+            tokio::spawn(async move { held.hold_login(id).await })
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reg.release_all_delays();
+        for hold in holds {
+            tokio::time::timeout(Duration::from_secs(2), hold)
+                .await
+                .expect("release did not end the hold")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn conn_registry_shortened_delay_ends_hold() {
+        // shortening a delay wakes a held login at the new deadline
+        let reg = ConnRegistry::default();
+        reg.set_delay("user@example.com", Instant::now() + Duration::from_secs(60));
+        let held = reg.clone();
+        let hold = tokio::spawn(async move { held.hold_login("user@example.com").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reg.set_delay("user@example.com", Instant::now());
+        tokio::time::timeout(Duration::from_secs(2), hold)
+            .await
+            .expect("shortened delay did not end the hold")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn conn_registry_extended_delay_keeps_hold() {
+        // extending a delay keeps a held login waiting past the original deadline
+        let reg = ConnRegistry::default();
+        reg.set_delay(
+            "user@example.com",
+            Instant::now() + Duration::from_millis(100),
+        );
+        let held = reg.clone();
+        let started = Instant::now();
+        let hold = tokio::spawn(async move { held.hold_login("user@example.com").await });
+        reg.set_delay(
+            "user@example.com",
+            Instant::now() + Duration::from_millis(400),
+        );
+        hold.await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+    }
+
     #[test]
     fn conn_registry_delay_window() {
         let reg = ConnRegistry::default();
-        assert!(reg.delay_remaining("user@example.com").is_none());
+        assert!(reg.delay("user@example.com").is_none());
         reg.set_delay("user@example.com", Instant::now() + Duration::from_secs(30));
-        assert!(reg.delay_remaining("user@example.com").is_some());
+        assert!(reg.delay("user@example.com").is_some());
         reg.set_delay("user@example.com", Instant::now());
-        assert!(reg.delay_remaining("user@example.com").is_none());
+        assert!(reg.delay("user@example.com").is_none());
     }
 
     #[test]

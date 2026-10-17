@@ -152,7 +152,7 @@ destination = "legacy"
 [[http.route]]
 match = "/**"
 extract = { from = "authorization" }
-fallback = "default"
+fallback = "legacy"
 
 # ---------------------------------------------------------------------------
 # Admin listener: the cache-integrity boundary. Bind to loopback or a dedicated

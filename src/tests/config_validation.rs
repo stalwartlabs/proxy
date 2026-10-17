@@ -501,3 +501,79 @@ sasl = ["NTLM"]
         );
     }
 }
+
+fn http_fallback_config(mapping_path: &str, fallback: &str) -> String {
+    format!(
+        r#"
+{}
+[routing]
+default_destination = "legacy"
+
+[destination.legacy]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.legacy.protocol.http]
+port = 80
+tls = "plain"
+
+[destination.imaponly]
+host = "127.0.0.1"
+proxy_protocol = false
+allow_plaintext_auth = true
+[destination.imaponly.protocol.imap]
+port = 143
+tls = "plain"
+
+[[http.route]]
+match = "/**"
+extract = {{ from = "authorization" }}
+fallback = "{fallback}"
+"#,
+        mapping_block(mapping_path)
+    )
+}
+
+#[test]
+fn http_route_fallback_must_name_known_http_destination() {
+    let m = mapping_file("");
+    let path = m.path().display().to_string();
+    assert!(Config::parse_and_validate(&http_fallback_config(&path, "legacy")).is_ok());
+    assert!(Config::parse_and_validate(&http_fallback_config(&path, "ghost")).is_err());
+    assert!(Config::parse_and_validate(&http_fallback_config(&path, "imaponly")).is_err());
+}
+
+fn install_script_config() -> &'static str {
+    let script = include_str!("../../install.sh");
+    let (_, rest) = script
+        .split_once("write_config_file() {\n    cat > \"$1\" <<'EOF'\n")
+        .expect("install.sh config heredoc start");
+    let (config, _) = rest
+        .split_once("\nEOF\n")
+        .expect("install.sh config heredoc end");
+    config
+}
+
+#[test]
+fn shipped_configs_validate() {
+    // every configuration shipped with the proxy passes boot validation
+    for (name, raw) in [
+        (
+            "config.sample.toml",
+            include_str!("../../resources/config.sample.toml"),
+        ),
+        (
+            "config.stalwart-upgrade.toml",
+            include_str!("../../resources/config.stalwart-upgrade.toml"),
+        ),
+        (
+            "config.dovecot-postfix.toml",
+            include_str!("../../resources/config.dovecot-postfix.toml"),
+        ),
+        ("install.sh", install_script_config()),
+    ] {
+        if let Err(e) = Config::parse_and_validate(raw) {
+            panic!("{name} fails validation: {e}");
+        }
+    }
+}

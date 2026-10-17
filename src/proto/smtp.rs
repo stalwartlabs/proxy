@@ -92,9 +92,9 @@ pub async fn handle_submission(
         } = handoff;
 
         let identifier = ctx.routing_identifier(identifier);
-        let dest_id = ctx.resolve(identifier.as_deref()).await;
         let started = std::time::Instant::now();
         common::hold_login(ctx, identifier.as_deref()).await;
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
         let fwd = forward::ForwardInfo::new(
             peer,
             local,

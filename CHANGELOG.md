@@ -8,8 +8,16 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Changed
 - Replaced `base64` with `encodify`.
+- An HTTP route's `fallback` is now honoured: unmatched or unmapped requests on that route go to the fallback destination instead of `routing.default_destination`. A `fallback` naming an undeclared destination, or one that does not declare the `http` protocol, is rejected at startup.
+- A login held by `POST /connections/delay` now resolves its destination when the hold ends instead of before it.
+- `PUT /mappings`, `DELETE /mappings` and `POST /cache/invalidate?identifier=` end the login delay of that identifier; `POST /mappings/reload` and `POST /cache/invalidate` without an identifier end every login delay. Held logins proceed at once to the newly mapped destination.
+- Calling `POST /connections/delay` again for an identifier also moves the hold deadline of logins already waiting (still capped at 120 seconds per login).
 
 ### Fixed
+- The sample configuration written by `install.sh` and `resources/config.sample.toml` named an undeclared HTTP route fallback (`default`) and failed startup validation.
+- `resources/config.stalwart-upgrade.toml` now documents the WebUI OAuth client identifiers (`https://<host>/admin/oauth-client.json`, `https://<host>/account/oauth-client.json`) and pins `/admin`, `/account`, `/api/auth/**` to the new deployment.
+- The `POST /config/reload` response no longer claims that cache capacity and TTLs require a restart; a reload rebuilds the router and its cache.
+- `POST /connections/delay` with a `seconds` value too large to represent now returns `400` instead of panicking.
 
 ## [1.0.4] - 2026-09-10
 

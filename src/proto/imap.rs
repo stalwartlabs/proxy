@@ -82,11 +82,10 @@ pub async fn handle(
         };
 
         let identifier = ctx.routing_identifier(identifier);
-        let dest_id = ctx.resolve(identifier.as_deref()).await;
-        tracing::debug!(destination = %dest_id, "imap routing decision");
-
         let started = std::time::Instant::now();
         common::hold_login(ctx, identifier.as_deref()).await;
+        let dest_id = ctx.resolve(identifier.as_deref()).await;
+        tracing::debug!(destination = %dest_id, "imap routing decision");
 
         let client_tls = client.is_tls();
         let fwd =

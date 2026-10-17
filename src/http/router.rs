@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use encodify::base64::STANDARD as BASE64;
@@ -21,7 +22,7 @@ pub enum RouteOutcome {
     },
     Identifier {
         identifier: Option<String>,
-        fallback: Option<String>,
+        fallback: Option<Arc<str>>,
     },
 }
 
@@ -35,7 +36,7 @@ struct CompiledExtract {
 struct CompiledRoute {
     destination: Option<String>,
     extract: Option<CompiledExtract>,
-    fallback: Option<String>,
+    fallback: Option<Arc<str>>,
     needs_body: bool,
 }
 
@@ -185,7 +186,7 @@ fn compile_route(route: &HttpRoute) -> Result<CompiledRoute> {
     Ok(CompiledRoute {
         destination: route.destination.clone(),
         extract,
-        fallback: route.fallback.clone(),
+        fallback: route.fallback.as_deref().map(Arc::from),
         needs_body,
     })
 }
@@ -319,7 +320,7 @@ destination = "legacy"
 [[route]]
 match = "/**"
 extract = { from = "authorization" }
-fallback = "default"
+fallback = "legacy"
 "#,
         );
         let head = parse(b"GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -330,7 +331,7 @@ fallback = "default"
         let head = parse(b"GET /dyn HTTP/1.1\r\nHost: x\r\n\r\n");
         match route(&router, &head, None) {
             RouteOutcome::Identifier { fallback, .. } => {
-                assert_eq!(fallback.as_deref(), Some("default"));
+                assert_eq!(fallback.as_deref(), Some("legacy"));
             }
             _ => panic!("expected identifier"),
         }

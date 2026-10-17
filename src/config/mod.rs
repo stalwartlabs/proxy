@@ -920,6 +920,14 @@ impl Config {
                     )));
                 }
             }
+            if let Some(fallback) = &route.fallback {
+                let dest = self.destination(fallback)?;
+                if !dest.protocol.contains_key(&Protocol::Http) {
+                    return Err(ProxyError::config(format!(
+                        "http route fallback {fallback:?} does not declare the http protocol"
+                    )));
+                }
+            }
             if let Some(extract) = &route.extract {
                 if extract.from == ExtractFrom::Body && extract.regex.is_none() {
                     return Err(ProxyError::config(

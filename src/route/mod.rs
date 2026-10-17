@@ -164,17 +164,21 @@ impl Router {
     }
 
     pub async fn resolve(&self, identifier: Option<&str>) -> Arc<str> {
+        self.resolve_or(identifier, &self.default_destination).await
+    }
+
+    pub async fn resolve_or(&self, identifier: Option<&str>, default: &Arc<str>) -> Arc<str> {
         let key: Cow<'_, str> = match identifier {
             Some(id) => match self.normalize {
                 Normalize::None => Cow::Borrowed(id),
                 Normalize::Lowercase => Cow::Owned(id.to_lowercase()),
             },
-            None => return self.default_destination.clone(),
+            None => return default.clone(),
         };
 
         if let Some(hit) = self.cache.get(key.as_ref()).await {
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return hit.dest(&self.default_destination);
+            return hit.dest(default);
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
 
@@ -215,7 +219,7 @@ impl Router {
             .try_get_with(key.into_boxed_str(), init)
             .await
             .unwrap_or(Route::Transient);
-        route.dest(&self.default_destination)
+        route.dest(default)
     }
 
     pub fn normalize(&self, identifier: &str) -> String {

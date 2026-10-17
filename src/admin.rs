@@ -303,6 +303,7 @@ async fn handle(
                     } else {
                         match ctx.router.upsert(&id, &dest).await {
                             Ok(()) => {
+                                ctx.conns.release_delay(&ctx.router.normalize(&id));
                                 tracing::info!(identifier = %crate::observe::redact(&id), %dest, "admin upserted mapping");
                                 write_response(&mut stream, 200, "OK", "ok\n").await?;
                             }
@@ -343,6 +344,7 @@ async fn handle(
                 } else {
                     match ctx.router.remove(&id).await {
                         Ok(existed) => {
+                            ctx.conns.release_delay(&ctx.router.normalize(&id));
                             tracing::info!(identifier = %crate::observe::redact(&id), existed, "admin removed mapping");
                             let body = if existed { "removed\n" } else { "absent\n" };
                             write_response(&mut stream, 200, "OK", body).await?;
@@ -379,7 +381,7 @@ async fn handle(
                     tracing::info!("admin reloaded configuration");
                     let body = serde_json::json!({
                         "reloaded": true,
-                        "note": "listener binds/protocols, admin bind/token, and cache capacity/TTLs require a restart to change",
+                        "note": "listener binds/protocols and admin bind/token require a restart to change",
                     })
                     .to_string();
                     write_json(&mut stream, 200, &body).await?;
@@ -400,10 +402,12 @@ async fn handle(
             match request.query_param("identifier") {
                 Some(id) => {
                     ctx.router.invalidate(&id).await;
+                    ctx.conns.release_delay(&ctx.router.normalize(&id));
                     tracing::info!(identifier = %crate::observe::redact(&id), "admin invalidated entry");
                 }
                 None => {
                     ctx.router.invalidate_all();
+                    ctx.conns.release_all_delays();
                     tracing::info!("admin invalidated entire cache");
                 }
             }
@@ -411,6 +415,7 @@ async fn handle(
         }
         ("POST", "/mappings/reload") => match ctx.router.reload().await {
             Ok(()) => {
+                ctx.conns.release_all_delays();
                 tracing::info!("admin reloaded mappings");
                 write_response(&mut stream, 200, "OK", "reloaded\n").await?;
             }
@@ -435,15 +440,17 @@ async fn handle(
                 request.query_param("identifier"),
                 request.query_param("seconds"),
             ) {
-                (Some(id), Some(secs)) => match secs.parse::<u64>() {
-                    Ok(seconds) => {
-                        let until =
-                            std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+                (Some(id), Some(secs)) => match secs.parse::<u64>().ok().and_then(|seconds| {
+                    std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_secs(seconds))
+                        .map(|until| (seconds, until))
+                }) {
+                    Some((seconds, until)) => {
                         ctx.conns.set_delay(&ctx.router.normalize(&id), until);
                         tracing::info!(identifier = %crate::observe::redact(&id), seconds, "admin set login delay");
                         write_response(&mut stream, 200, "OK", "ok\n").await?;
                     }
-                    Err(_) => {
+                    None => {
                         write_response(&mut stream, 400, "Bad Request", "invalid seconds\n")
                             .await?;
                     }

@@ -165,10 +165,19 @@ destination = "old"
 match = "/api/auth"
 destination = "new"
 [[http.route]]
+match = "/api/auth/**"
+destination = "new"
+[[http.route]]
 match = "/api/discover/**"
 destination = "new"
 [[http.route]]
+match = "/admin"
+destination = "new"
+[[http.route]]
 match = "/admin/**"
+destination = "new"
+[[http.route]]
+match = "/account"
 destination = "new"
 [[http.route]]
 match = "/account/**"
@@ -181,17 +190,20 @@ match = "/device"
 destination = "new"
 
 # OAuth token exchange is shared; route it by the web client that requested it.
-# Add matching mapping entries:  webadmin  old   and   stalwart-webui  new
+# Add matching mapping entries (replace the hostname with the public one):
+#   webadmin                                             old
+#   https://mail.example.org/admin/oauth-client.json     new
+#   https://mail.example.org/account/oauth-client.json   new
 [[http.route]]
 match = "/auth/token"
 extract = { from = "body", regex = "client_id=([^&]+)" }
 fallback = "old"
 
-# Everything else: route by the authenticated account, fall back to default.
+# Everything else: route by the authenticated account, fall back to the old deployment.
 [[http.route]]
 match = "/**"
 extract = { from = "authorization" }
-fallback = "default"
+fallback = "old"
 
 # ---------------------------------------------------------------------------
 # Listeners: the public ports clients connect to. These take over the ports the

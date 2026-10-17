@@ -64,6 +64,29 @@ async fn router_resolves_normalizes_and_caches() {
 }
 
 #[tokio::test]
+async fn router_resolve_or_uses_given_fallback() {
+    let mapping = mapping_file("user@example.com\tprimary\n");
+    let toml = config(&mapping.path().display().to_string());
+    let router = build_router(&toml).await;
+    let fallback: std::sync::Arc<str> = "primary".into();
+    let legacy: std::sync::Arc<str> = "legacy".into();
+
+    assert_eq!(&*router.resolve_or(None, &fallback).await, "primary");
+    assert_eq!(
+        &*router.resolve_or(Some("nobody@x"), &fallback).await,
+        "primary"
+    );
+    assert_eq!(
+        &*router.resolve_or(Some("nobody@x"), &legacy).await,
+        "legacy"
+    );
+    assert_eq!(
+        &*router.resolve_or(Some("user@example.com"), &legacy).await,
+        "primary"
+    );
+}
+
+#[tokio::test]
 async fn router_cache_hits_and_misses() {
     let mapping = mapping_file("user@example.com\tprimary\n");
     let toml = config(&mapping.path().display().to_string());
