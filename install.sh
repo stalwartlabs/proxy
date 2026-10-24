@@ -266,8 +266,8 @@ tls = "implicit"
 port = 995
 tls = "implicit"
 [destination.stalwart.protocol.submission]
-port = 587
-tls = "starttls"
+port = 465
+tls = "implicit"
 [destination.stalwart.protocol.managesieve]
 port = 4190
 tls = "starttls"
@@ -277,37 +277,37 @@ tls = "implicit"
 
 [listener.imap]
 protocol = "imap"
-bind = ["0.0.0.0:993", "[::]:993"]
+bind = ["[::]:993"]
 tls = "implicit"
 
 [listener.imap-starttls]
 protocol = "imap"
-bind = ["0.0.0.0:143", "[::]:143"]
+bind = ["[::]:143"]
 tls = "starttls"
 
 [listener.pop3]
 protocol = "pop3"
-bind = ["0.0.0.0:995", "[::]:995"]
+bind = ["[::]:995"]
 tls = "implicit"
 
 [listener.submission]
 protocol = "submission"
-bind = ["0.0.0.0:587", "[::]:587"]
+bind = ["[::]:587"]
 tls = "starttls"
 
 [listener.submissions]
 protocol = "submission"
-bind = ["0.0.0.0:465", "[::]:465"]
+bind = ["[::]:465"]
 tls = "implicit"
 
 [listener.managesieve]
 protocol = "managesieve"
-bind = ["0.0.0.0:4190", "[::]:4190"]
+bind = ["[::]:4190"]
 tls = "starttls"
 
 [listener.https]
 protocol = "http"
-bind = ["0.0.0.0:443", "[::]:443"]
+bind = ["[::]:443"]
 tls = "implicit"
 forwarded = "off"
 

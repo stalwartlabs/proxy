@@ -3,3 +3,4 @@
 *.md
 !CHANGELOG.md
 !README.md
+__pycache__/

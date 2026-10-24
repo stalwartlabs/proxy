@@ -92,8 +92,8 @@ tls = "implicit"
 port = 995
 tls = "implicit"
 [destination.stalwart.protocol.submission]
-port = 587
-tls = "starttls"
+port = 465
+tls = "implicit"
 [destination.stalwart.protocol.managesieve]
 port = 4190
 tls = "starttls"
@@ -104,40 +104,47 @@ tls = "implicit"
 # ---------------------------------------------------------------------------
 # Listeners: one entry per protocol + TLS mode + bind set.
 # tls = "implicit" | "starttls" | "plain".
+#
+# Each listener binds [::] only: on Linux and macOS that socket also accepts
+# IPv4 clients, and on Linux a second 0.0.0.0 entry for the same port fails
+# with "Address already in use". Where IPv6 sockets are IPv6-only (FreeBSD by
+# default, or net.ipv6.bindv6only = 1 on Linux), add "0.0.0.0:<port>" to each
+# bind list. On a host whose kernel has IPv6 disabled, [::] cannot be bound:
+# use "0.0.0.0:<port>" instead.
 # ---------------------------------------------------------------------------
 [listener.imap]
 protocol = "imap"
-bind = ["0.0.0.0:993", "[::]:993"]
+bind = ["[::]:993"]
 tls = "implicit"
 
 [listener.imap-starttls]
 protocol = "imap"
-bind = ["0.0.0.0:143", "[::]:143"]
+bind = ["[::]:143"]
 tls = "starttls"
 
 [listener.pop3]
 protocol = "pop3"
-bind = ["0.0.0.0:995", "[::]:995"]
+bind = ["[::]:995"]
 tls = "implicit"
 
 [listener.submission]
 protocol = "submission"
-bind = ["0.0.0.0:587", "[::]:587"]
+bind = ["[::]:587"]
 tls = "starttls"
 
 [listener.submissions]
 protocol = "submission"
-bind = ["0.0.0.0:465", "[::]:465"]
+bind = ["[::]:465"]
 tls = "implicit"
 
 [listener.managesieve]
 protocol = "managesieve"
-bind = ["0.0.0.0:4190", "[::]:4190"]
+bind = ["[::]:4190"]
 tls = "starttls"
 
 [listener.https]
 protocol = "http"
-bind = ["0.0.0.0:443", "[::]:443"]
+bind = ["[::]:443"]
 tls = "implicit"
 forwarded = "off"
 
