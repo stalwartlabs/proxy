@@ -24,19 +24,22 @@ RUN \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
     apt-get update && \
     apt-get install -yq --no-install-recommends ca-certificates curl git jq xz-utils make libclang-19-dev
-# Zig is pinned to 0.13.0. Zig 0.14+ changed how its default target ABI is
-# resolved for `x86_64-linux-gnu`-style triples, and on this dependency tree
-# (aws-lc-sys, libsqlite3-sys, rust-std 1.87+) that surfaces as ld.lld
-# undefined references to glibc 2.33+ symbols. Zig 0.13 produces binaries with
-# a max glibc ref of ~2.28 which stays compatible with Debian 11 / RHEL 8.
 RUN \
-    ZIG_VERSION=0.13.0 && \
-    curl --retry 5 -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-$(uname -m)-${ZIG_VERSION}.tar.xz" | tar -J -x -C /usr/local && \
-    ln -s "/usr/local/zig-linux-$(uname -m)-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
+    ZIG_VERSION=0.17.0 && \
+    case "$(uname -m)" in \
+        x86_64) ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 ;; \
+        aarch64) ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 ;; \
+        *) exit 1 ;; \
+    esac && \
+    curl --retry 5 -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
+    tar -J -x -C /usr/local -f /tmp/zig.tar.xz && \
+    rm /tmp/zig.tar.xz && \
+    ln -s "/usr/local/zig-$(uname -m)-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
     zig version
 # Install cargo-binstall
 RUN curl --retry 5 -fL --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-# Install cargo-chef & sccache & cargo-zigbuild. Versions are pinned so that an
+# Install cargo-chef & sccache. Versions are pinned so that an
 # upstream release without prebuilt binaries for this platform cannot silently
 # turn this into a from-source build, and the `compile` strategy is disabled
 # because that fallback needs an OpenSSL toolchain this image does not carry:
@@ -44,11 +47,12 @@ RUN curl --retry 5 -fL --proto '=https' --tlsv1.2 -sSf https://raw.githubusercon
 RUN \
     for attempt in 1 2 3; do \
         cargo binstall --no-confirm --disable-strategies compile \
-            cargo-chef@0.1.78 sccache@0.17.0 cargo-zigbuild@0.23.2 && break; \
+            cargo-chef@0.1.78 sccache@0.17.0 && break; \
         echo "cargo binstall attempt ${attempt} failed, retrying"; \
         sleep $((attempt * 15)); \
     done && \
-    command -v cargo-chef && command -v sccache && command -v cargo-zigbuild
+    command -v cargo-chef && command -v sccache
+RUN cargo install --locked --git https://github.com/rust-cross/cargo-zigbuild --rev d9f7fd32fbac13cc26d23847835f7f23a5ed3a25 cargo-zigbuild
 
 # *****************
 # Planner
@@ -67,6 +71,7 @@ WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ARG TARGET
 ARG BUILD_ENV
+ARG GLIBC_VERSION=2.28
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Install toolchain and specify some env variables
 RUN \
@@ -74,6 +79,13 @@ RUN \
     rustup target add ${TARGET} && \
     mkdir -p artifact && \
     touch /env-cargo && \
+    if [[ "${TARGET}" == *-gnu* ]]; then \
+        echo "export BUILD_TARGET=${TARGET}.${GLIBC_VERSION}" >> /env-cargo; \
+        mkdir -p target && \
+        ln -s "${TARGET}" "target/${TARGET}.${GLIBC_VERSION}"; \
+    else \
+        echo "export BUILD_TARGET=${TARGET}" >> /env-cargo; \
+    fi && \
     if [ ! -z "${BUILD_ENV}" ]; then \
         echo "export ${BUILD_ENV}" >> /env-cargo; \
         echo "Setting up ${BUILD_ENV}"; \
@@ -85,7 +97,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     source /env-cargo && \
-    cargo chef cook --recipe-path recipe.json --zigbuild --release --target ${TARGET} -p proxy
+    cargo chef cook --recipe-path recipe.json --zigbuild --release --target ${BUILD_TARGET} -p proxy
 # Copy the source code
 COPY . .
 ENV RUSTC_WRAPPER="sccache" \
@@ -97,7 +109,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     source /env-cargo && \
-    cargo zigbuild --release --target ${TARGET} -p proxy && \
+    cargo zigbuild --release --target ${BUILD_TARGET} -p proxy && \
     mv /app/target/${TARGET}/release/proxy /app/artifact/proxy
 
 # *****************
