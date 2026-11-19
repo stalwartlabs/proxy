@@ -4,35 +4,39 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-pub mod common;
+pub mod backend;
 pub mod forward;
 pub mod imap;
 pub mod managesieve;
+pub mod passthrough;
 pub mod pop3;
-pub mod smtp;
+pub mod sasl_exchange;
+pub mod session;
+pub mod submission;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use crate::config::{ListenerConfig, Protocol};
+use crate::config::Protocol;
 use crate::error::Result;
-use crate::net::BoxedStream;
-use common::Ctx;
+use crate::http;
+use crate::net::stream::ClientStream;
+use crate::runtime::{ListenerId, Runtime};
 
 pub async fn dispatch(
-    ctx: &Ctx,
-    listener: &ListenerConfig,
-    stream: BoxedStream,
+    rt: Arc<Runtime>,
+    protocol: Protocol,
+    id: ListenerId,
+    stream: ClientStream,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Result<()> {
-    match listener.protocol {
-        Protocol::Imap => imap::handle(ctx, listener, stream, peer, local).await,
-        Protocol::Pop3 => pop3::handle(ctx, listener, stream, peer, local).await,
-        Protocol::ManageSieve => managesieve::handle(ctx, listener, stream, peer, local).await,
-        Protocol::Submission => smtp::handle_submission(ctx, listener, stream, peer, local).await,
-        Protocol::Smtp | Protocol::Lmtp => {
-            smtp::handle_passthrough(ctx, listener, stream, peer, local).await
-        }
-        Protocol::Http => crate::http::proxy::handle(ctx, listener, stream, peer, local).await,
+    match protocol {
+        Protocol::Imap => imap::handle(rt, id, stream, peer, local).await,
+        Protocol::Pop3 => pop3::handle(rt, id, stream, peer, local).await,
+        Protocol::ManageSieve => managesieve::handle(rt, id, stream, peer, local).await,
+        Protocol::Submission => submission::handle(rt, id, stream, peer, local).await,
+        Protocol::Smtp | Protocol::Lmtp => passthrough::handle(rt, id, stream, peer, local).await,
+        Protocol::Http => http::proxy::handle(rt, id, stream, peer, local).await,
     }
 }

@@ -5,7 +5,7 @@
 </p>
 
 <h3 align="center">
-  Multi-protocol e-mail migration proxy for Stalwart
+  Multi-protocol mail proxy for Stalwart
 </h3>
 
 <br>
@@ -15,7 +15,7 @@
   &nbsp;
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg?label=license&style=flat-square" alt="License: AGPL v3"></a>
   &nbsp;
-  <a href="https://stalw.art/docs/install/get-started"><img src="https://img.shields.io/badge/read_the-docs-red?style=flat-square" alt="Documentation"></a>
+  <a href="https://stalw.art/docs/cluster/proxy/"><img src="https://img.shields.io/badge/read_the-docs-red?style=flat-square" alt="Documentation"></a>
 </p>
 <p align="center">
   <a href="https://mastodon.social/@stalwartlabs"><img src="https://img.shields.io/mastodon/follow/109929667531941122?style=flat-square&logo=mastodon&color=%236364ff&label=Follow%20on%20Mastodon" alt="Mastodon"></a>
@@ -30,44 +30,45 @@
 
 ## Features
 
-The migration proxy sits in front of one or more mail backends and decides, on a per-account basis, which backend a given connection belongs to. It terminates IMAP, POP3, ManageSieve, SMTP submission, SMTP/LMTP and HTTP (JMAP) sessions, identifies the account behind each connection from the credentials the client already presents, looks up the destination that account is assigned to, replays the authentication to that backend, and bridges the session. Because the routing decision is made from the existing credentials, no client reconfiguration is required: users keep the same server name, ports and passwords while the proxy routes them to the correct system.
+The Stalwart proxy sits in front of one or more mail servers and routes every connection to the right one per account, using the credentials the client already presents. In a Stalwart cluster it pins each account to one node so the node's caches stay warm; during a migration it lets an old and a new server (Dovecot, Cyrus, an older Stalwart) run side by side while accounts move one at a time, without reconfiguring clients and without downtime.
 
-It is built for three scenarios: migrating from legacy servers (Dovecot, Cyrus and other IMAP/POP3/SMTP servers) onto Stalwart one mailbox at a time, migrating between Stalwart versions by running an old and a new deployment side by side, and acting as a cache-locality router in front of a Stalwart cluster so each account is consistently pinned to the same node.
+- **Multi-protocol.** IMAP, POP3, ManageSieve, SMTP submission and HTTP (JMAP, WebDAV, WebSocket), plus SMTP and LMTP pass-through.
+- **Per-account routing.** Mapping store in a file, Redis or SQL (PostgreSQL, MySQL, SQLite), with an in-memory cache and a default destination.
+- **Credential-aware.** Routing identifier from SASL `PLAIN`, `LOGIN`, `OAUTHBEARER` and `XOAUTH2`, HTTP Basic and Bearer, JWT and Stalwart token claims; authentication is replayed to the backend and never stored.
+- **Client address forwarding.** PROXY protocol, or `XCLIENT` and IMAP `ID` for Dovecot and Postfix, plus `Forwarded` headers for HTTP.
+- **TLS on both legs.** SNI certificate selection inbound; implicit TLS, STARTTLS, pinned certificates and mutual TLS towards backends.
+- **Resilient.** Per-destination circuit breaker, retries, loop prevention and graceful draining.
+- **Web interface and API.** Live traffic, destination health, sessions, mappings and cache; account moves with kicks and login delays; configuration editing and certificate upload, validated and applied live without a restart.
+- **Locked-down management plane.** TLS only, token or browser sessions, per-address lockout, an operator allowlist and a configuration history.
 
-- **Multi-protocol.** Proxies IMAP, POP3, ManageSieve, SMTP submission, SMTP/LMTP pass-through and HTTP/JMAP, including JMAP-over-WebSocket.
-- **Per-account routing.** Resolves each account to a backend through a mapping store backed by a flat file, Redis or a SQL database (PostgreSQL, MySQL or SQLite), with an in-memory cache and a configurable default destination for unmapped accounts.
-- **Credential-aware.** Extracts the routing identifier from SASL `PLAIN`, `OAUTHBEARER` and `XOAUTH2` exchanges, from HTTP Basic and Bearer authentication, and from JWT and Stalwart access-token claims, then replays authentication to the backend without ever persisting passwords.
-- **Backend-friendly forwarding.** Conveys the real client identity using the PROXY protocol for modern backends, or the `XCLIENT` and IMAP `ID` extensions for Dovecot and Postfix, with `Forwarded` and `X-Forwarded-For` headers for HTTP.
-- **Flexible TLS.** Terminates inbound TLS with SNI-based certificate selection, and reaches backends over implicit TLS, STARTTLS or plaintext, with platform, pinned-certificate or mutual-TLS verification on the backend leg.
-- **Resilient.** Per-destination health gating with a circuit breaker, connection retries, idle timeouts and graceful draining on shutdown.
-- **Operable at runtime.** An authenticated HTTP management API exposes statistics, mapping management, cache invalidation, connection control and configuration reload without a restart.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./img/dashboard-dark.webp">
+    <img src="./img/dashboard-light.webp" alt="Stalwart proxy management dashboard" width="800">
+  </picture>
+</p>
 
-## Installing
+## Quick start
 
-The proxy is distributed as a single self-contained binary and as a multi-architecture container image (`amd64`, `arm64`, `armv7` and `armv6`), in both glibc and Alpine/musl variants.
-
-The container image is published to the GitHub Container Registry and Docker Hub. Mount a configuration directory at `/etc/proxy` and run:
+With Docker, mount an empty directory owned by uid 2000, publish the management port on the loopback interface only, and publish the mail ports the listeners will use:
 
 ```bash
-docker run -d --name proxy \
-  -v /srv/proxy:/etc/proxy \
-  -p 993:993 -p 143:143 -p 995:995 \
-  -p 587:587 -p 465:465 -p 4190:4190 -p 443:443 \
+docker run -d --name proxy -v /srv/proxy:/etc/proxy -p 127.0.0.1:9443:9443 \
+  -p 25:25 -p 143:143 -p 993:993 -p 110:110 -p 995:995 -p 587:587 -p 465:465 -p 4190:4190 -p 443:443 \
   ghcr.io/stalwartlabs/proxy:latest
 ```
 
-To install directly on a host, the install script provisions the binary, a service account, a service unit and sample configuration files:
+On a Linux or macOS host, use the install script:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/stalwartlabs/proxy/main/install.sh | sudo sh
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/stalwartlabs/proxy/main/install.sh | sudo sh
 ```
 
-The service is installed but not started, because the sample configuration must first be edited for the local destinations, listeners and TLS certificates. Full instructions are in the [documentation](https://stalw.art/docs/migration/proxy).
+Both create a minimal configuration with only the management interface, at `https://127.0.0.1:9443/ui/`, and print where the admin token is. Destinations, mappings and listeners are then added from the web interface. Keep the management port on the loopback interface or a trusted management network: inside a container it binds `0.0.0.0:9443`, which every container on the same Docker network can reach.
 
 ## Documentation
 
-All documentation is available at [stalw.art/docs/migration/proxy](https://stalw.art/docs/migration/proxy).
+All documentation is available at [stalw.art/docs/cluster/proxy](https://stalw.art/docs/cluster/proxy/).
 
 ## Support
 

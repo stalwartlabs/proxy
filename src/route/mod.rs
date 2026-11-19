@@ -4,64 +4,134 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+pub mod key;
 pub mod store;
 
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ahash::AHashSet;
-use moka::future::Cache;
-use moka::policy::Expiry;
+use ahash::{AHashMap, AHashSet};
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, Weighter};
 
-use crate::config::{Config, MappingConfig, MappingSource, Normalize};
-use crate::error::{ProxyError, Result};
-use store::MappingStore;
-use store::file::FileStore;
-use store::redis::RedisStore;
-use store::sql::SqlStore;
+#[cfg(all(test, proxy_tests))]
+use crate::config::Normalize;
+use crate::config::{Config, MappingConfig};
+use crate::error::{ProxyError, Result, Side, Stage};
+use crate::runtime::health::{Clock, Millis};
+use crate::runtime::metrics::CacheCounters;
+use crate::runtime::{DestId, IdTable};
+use key::RoutingKey;
+use store::file::PendingMappings;
+use store::{DestCounts, MappingStore, Page, Stored, Upsert};
 
 type Store = Arc<MappingStore>;
 
-pub fn normalize_key(id: &str, normalize: Normalize) -> String {
-    match normalize {
-        Normalize::None => id.to_string(),
-        Normalize::Lowercase => id.to_lowercase(),
-    }
-}
-
-pub fn master_account<'a>(id: &'a str, separators: &[String]) -> &'a str {
-    let mut cut = id.len();
-    for sep in separators {
-        if sep.is_empty() {
-            continue;
-        }
-        if let Some(pos) = id.find(sep.as_str()) {
-            cut = cut.min(pos);
-        }
-    }
-    &id[..cut]
-}
-
-#[derive(Clone)]
-enum Route {
-    Mapped(Arc<str>),
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route {
+    Mapped(DestId),
     Default,
     Transient,
 }
 
-impl Route {
-    fn dest(&self, default: &Arc<str>) -> Arc<str> {
-        match self {
-            Route::Mapped(d) => d.clone(),
-            Route::Default | Route::Transient => default.clone(),
+const _: () = assert!(size_of::<Route>() <= 4);
+
+pub const TRANSIENT_TTL: Duration = Duration::from_secs(5);
+pub const MAX_PAGE_SIZE: usize = 1000;
+const CACHE_ENTRY_OVERHEAD: u64 = 192;
+const CACHE_KEY_ESTIMATE: u64 = 64;
+
+#[derive(Clone, Copy, Debug)]
+struct Cached {
+    route: Route,
+    deadline: Millis,
+}
+
+const _: () = assert!(size_of::<Cached>() <= 16);
+
+impl Cached {
+    fn live(&self, now: Millis) -> bool {
+        self.deadline > now
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CacheWeight {
+    Entries,
+    Bytes,
+}
+
+#[derive(Clone, Copy)]
+struct CacheBounds {
+    items: u64,
+    weight: u64,
+    weighter: CacheWeight,
+}
+
+impl CacheBounds {
+    const NONE: CacheBounds = CacheBounds {
+        items: 0,
+        weight: 0,
+        weighter: CacheWeight::Entries,
+    };
+
+    fn for_mapping(mapping: &MappingConfig) -> Self {
+        match mapping.cache_max_bytes {
+            Some(bytes) => CacheBounds {
+                items: bytes / (CACHE_ENTRY_OVERHEAD + CACHE_KEY_ESTIMATE),
+                weight: bytes,
+                weighter: CacheWeight::Bytes,
+            },
+            None => CacheBounds {
+                items: mapping.cache_max_entries,
+                weight: mapping.cache_max_entries,
+                weighter: CacheWeight::Entries,
+            },
         }
     }
 }
 
-const TRANSIENT_TTL: Duration = Duration::from_secs(5);
+impl Weighter<Arc<str>, Cached> for CacheWeight {
+    fn weight(&self, key: &Arc<str>, _: &Cached) -> u64 {
+        match self {
+            CacheWeight::Entries => 1,
+            CacheWeight::Bytes => u64::try_from(key.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(CACHE_ENTRY_OVERHEAD),
+        }
+    }
+}
 
+type RouteCache = Cache<Arc<str>, Cached, CacheWeight>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheState {
+    Miss,
+    Positive,
+    Negative,
+    Transient,
+}
+
+pub struct Inspection {
+    pub store: Result<Option<Arc<str>>>,
+    pub route: Route,
+    pub cache: CacheState,
+    pub ttl_remaining: Option<Duration>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Upserted {
+    pub created: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BatchResult {
+    pub upserted: usize,
+    pub created: u64,
+}
+
+#[derive(Clone, Copy)]
 struct TtlExpiry {
     positive: Duration,
     negative: Duration,
@@ -69,6 +139,20 @@ struct TtlExpiry {
 }
 
 impl TtlExpiry {
+    const NONE: TtlExpiry = TtlExpiry {
+        positive: Duration::ZERO,
+        negative: Duration::ZERO,
+        transient: Duration::ZERO,
+    };
+
+    fn for_mapping(mapping: &MappingConfig) -> Self {
+        TtlExpiry {
+            positive: mapping.positive_ttl,
+            negative: mapping.negative_ttl,
+            transient: TRANSIENT_TTL.min(mapping.negative_ttl),
+        }
+    }
+
     fn ttl(&self, value: &Route) -> Duration {
         match value {
             Route::Mapped(_) => self.positive,
@@ -78,168 +162,286 @@ impl TtlExpiry {
     }
 }
 
-impl Expiry<Box<str>, Route> for TtlExpiry {
-    fn expire_after_create(
-        &self,
-        _key: &Box<str>,
-        value: &Route,
-        _created_at: std::time::Instant,
-    ) -> Option<Duration> {
-        Some(self.ttl(value))
-    }
-
-    fn expire_after_update(
-        &self,
-        _key: &Box<str>,
-        value: &Route,
-        _updated_at: std::time::Instant,
-        _duration_until_expiry: Option<Duration>,
-    ) -> Option<Duration> {
-        Some(self.ttl(value))
-    }
-}
-
 #[derive(Default)]
 pub struct RouterStats {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
 }
 
-pub struct MappingDiagnosis {
-    pub normalized: String,
-    pub destination: String,
-    pub routed_to_default: bool,
-    pub cached: bool,
+impl RouterStats {
+    pub fn snapshot(&self) -> CacheCounters {
+        CacheCounters {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub struct Router {
-    cache: Cache<Box<str>, Route>,
+    cache: RouteCache,
+    expiry: TtlExpiry,
+    clock: Clock,
     store: Store,
+    ids: Arc<IdTable>,
+    #[cfg(all(test, proxy_tests))]
     default_destination: Arc<str>,
     valid_destinations: AHashSet<Box<str>>,
+    #[cfg(all(test, proxy_tests))]
     normalize: Normalize,
     lookup_timeout: Duration,
     pub stats: RouterStats,
 }
 
 impl Router {
-    pub async fn build(config: &Config, valid_destinations: Vec<String>) -> Result<Self> {
-        let valid: AHashSet<Box<str>> = valid_destinations
-            .iter()
-            .map(|s| s.as_str().into())
-            .collect();
-        let store = build_store(&config.mapping, valid_destinations).await?;
-        Ok(Self::with_store(
-            &config.mapping,
-            store,
-            config.routing.default_destination.as_str().into(),
-            valid,
-        ))
-    }
-
-    pub fn with_store(
-        mapping: &MappingConfig,
-        store: Store,
-        default_destination: Arc<str>,
-        valid_destinations: AHashSet<Box<str>>,
-    ) -> Self {
-        let expiry = TtlExpiry {
-            positive: mapping.positive_ttl,
-            negative: mapping.negative_ttl,
-            transient: TRANSIENT_TTL.min(mapping.negative_ttl),
+    pub async fn build(
+        config: &Config,
+        dest_names: &AHashMap<Box<str>, DestId>,
+        ids: Arc<IdTable>,
+        clock: Clock,
+    ) -> Result<Self> {
+        let valid: AHashSet<Box<str>> = dest_names.keys().cloned().collect();
+        let (store, expiry, bounds, lookup_timeout) = match &config.mapping {
+            Some(mapping) => (
+                Arc::new(MappingStore::build(mapping, dest_names).await?),
+                TtlExpiry::for_mapping(mapping),
+                CacheBounds::for_mapping(mapping),
+                mapping.lookup_timeout,
+            ),
+            None => (
+                Arc::new(MappingStore::Empty),
+                TtlExpiry::NONE,
+                CacheBounds::NONE,
+                TRANSIENT_TTL,
+            ),
         };
-        let cache = Cache::builder()
-            .max_capacity(mapping.cache_max_entries)
-            .expire_after(expiry)
-            .build();
-        Router {
+        let cache = RouteCache::with(
+            usize::try_from(bounds.items).unwrap_or(usize::MAX),
+            bounds.weight,
+            bounds.weighter,
+            DefaultHashBuilder::default(),
+            DefaultLifecycle::default(),
+        );
+        Ok(Router {
             cache,
+            expiry,
+            clock,
             store,
-            default_destination,
-            valid_destinations,
-            normalize: mapping.normalize,
-            lookup_timeout: mapping.lookup_timeout,
+            ids,
+            #[cfg(all(test, proxy_tests))]
+            default_destination: config
+                .routing
+                .as_ref()
+                .map_or("", |routing| routing.default_destination.as_str())
+                .into(),
+            valid_destinations: valid,
+            #[cfg(all(test, proxy_tests))]
+            normalize: config
+                .mapping
+                .as_ref()
+                .map_or(Normalize::None, |mapping| mapping.normalize),
+            lookup_timeout,
             stats: RouterStats::default(),
-        }
+        })
     }
 
-    pub async fn resolve(&self, identifier: Option<&str>) -> Arc<str> {
-        self.resolve_or(identifier, &self.default_destination).await
+    pub async fn route(&self, key: &RoutingKey) -> Route {
+        self.lookup(key, self.route_from_store(key)).await
     }
 
-    pub async fn resolve_or(&self, identifier: Option<&str>, default: &Arc<str>) -> Arc<str> {
-        let key: Cow<'_, str> = match identifier {
-            Some(id) => match self.normalize {
-                Normalize::None => Cow::Borrowed(id),
-                Normalize::Lowercase => Cow::Owned(id.to_lowercase()),
-            },
-            None => return default.clone(),
-        };
-
-        if let Some(hit) = self.cache.get(key.as_ref()).await {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return hit.dest(default);
+    async fn lookup(&self, key: &RoutingKey, load: impl Future<Output = Route>) -> Route {
+        let now = self.clock.now();
+        match self.cache.get(key.as_str()) {
+            Some(hit) if hit.live(now) => {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return hit.route;
+            }
+            Some(_) => {
+                self.cache
+                    .remove_if(key.as_str(), |cached| !cached.live(now));
+            }
+            None => {}
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        let guard = match self.cache.get_value_or_guard_async(key.shared()).await {
+            Ok(cached) => return cached.route,
+            Err(guard) => guard,
+        };
+        let route = load.await;
+        let deadline = self.clock.now().saturating_add(self.expiry.ttl(&route));
+        let _ = guard.insert(Cached { route, deadline });
+        route
+    }
 
-        let key = key.into_owned();
-        let store = self.store.clone();
-        let valid = &self.valid_destinations;
-        let lookup_timeout = self.lookup_timeout;
-        let lookup_key = key.clone();
-        let init = async move {
-            let route = match tokio::time::timeout(lookup_timeout, store.lookup(&lookup_key)).await
-            {
-                Ok(Ok(Some(dest))) => {
-                    if !valid.is_empty() && !valid.contains(dest.as_str()) {
-                        tracing::warn!(
-                            destination = %dest,
-                            "mapping store returned an undeclared destination; routing to default"
-                        );
-                        Route::Default
-                    } else {
-                        Route::Mapped(Arc::from(dest))
-                    }
-                }
-                Ok(Ok(None)) => Route::Default,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "mapping store lookup failed; routing to default");
-                    Route::Transient
-                }
-                Err(_) => {
-                    tracing::warn!("mapping store lookup timed out; routing to default");
-                    Route::Transient
+    async fn bounded<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(self.lookup_timeout, op)
+            .await
+            .map_err(|_| ProxyError::timeout(Stage::Store, Side::Backend))?
+    }
+
+    async fn route_from_store(&self, key: &RoutingKey) -> Route {
+        match self.bounded(self.store.lookup(key.as_str())).await {
+            Ok(Some(stored)) => self.mapped(&stored),
+            Ok(None) => Route::Default,
+            Err(e) => {
+                tracing::warn!(error = %e, "mapping store lookup failed; routing to default");
+                Route::Transient
+            }
+        }
+    }
+
+    fn mapped(&self, stored: &Stored) -> Route {
+        let dest = match stored {
+            Stored::Dest(id) => return Route::Mapped(*id),
+            Stored::Name(dest) => &**dest,
+        };
+        let declared = self.is_valid_destination(dest);
+        match self.ids.dest_id(dest) {
+            Some(id) if declared => Route::Mapped(id),
+            _ => {
+                tracing::warn!(
+                    destination = %dest,
+                    "mapping store returned an undeclared destination; routing to default"
+                );
+                Route::Default
+            }
+        }
+    }
+
+    pub async fn inspect(&self, key: &RoutingKey) -> Inspection {
+        let now = self.clock.now();
+        let cached = self
+            .cache
+            .peek(key.as_str())
+            .filter(|cached| cached.live(now));
+        let stored = self.bounded(self.store.lookup(key.as_str())).await;
+        let fresh = match &stored {
+            Ok(Some(stored)) => self.mapped(stored),
+            Ok(None) => Route::Default,
+            Err(_) => Route::Transient,
+        };
+        let store = stored.map(|stored| {
+            stored.and_then(|stored| match stored {
+                Stored::Dest(id) => self.ids.dest_name(id),
+                Stored::Name(name) => Some(Arc::from(name)),
+            })
+        });
+        let Some(cached) = cached else {
+            return Inspection {
+                store,
+                route: fresh,
+                cache: CacheState::Miss,
+                ttl_remaining: None,
+            };
+        };
+        Inspection {
+            store,
+            route: cached.route,
+            cache: match cached.route {
+                Route::Mapped(_) => CacheState::Positive,
+                Route::Default => CacheState::Negative,
+                Route::Transient => CacheState::Transient,
+            },
+            ttl_remaining: Some(Duration::from_millis(
+                cached.deadline.0.saturating_sub(now.0),
+            )),
+        }
+    }
+
+    fn declared_name(&self, dest: DestId) -> Result<Arc<str>> {
+        self.ids
+            .dest_name(dest)
+            .filter(|name| self.is_valid_destination(name))
+            .ok_or_else(|| ProxyError::config("unknown destination"))
+    }
+
+    pub async fn upsert(&self, key: &RoutingKey, dest: DestId) -> Result<Upserted> {
+        let entry = Upsert {
+            key: key.as_str(),
+            dest,
+            name: self.declared_name(dest)?,
+        };
+        let created = self.store.upsert_many(std::slice::from_ref(&entry)).await?;
+        self.cache.remove(key.as_str());
+        Ok(Upserted {
+            created: created > 0,
+        })
+    }
+
+    pub async fn upsert_many(&self, entries: &[(RoutingKey, DestId)]) -> Result<BatchResult> {
+        let mut names: AHashMap<DestId, Arc<str>> = AHashMap::new();
+        let mut batch = Vec::with_capacity(entries.len());
+        for (key, dest) in entries {
+            let name = match names.get(dest) {
+                Some(name) => name.clone(),
+                None => {
+                    let name = self.declared_name(*dest)?;
+                    names.insert(*dest, name.clone());
+                    name
                 }
             };
-            Ok::<Route, std::convert::Infallible>(route)
-        };
+            batch.push(Upsert {
+                key: key.as_str(),
+                dest: *dest,
+                name,
+            });
+        }
+        let created = self.store.upsert_many(&batch).await?;
+        for (key, _) in entries {
+            self.cache.remove(key.as_str());
+        }
+        Ok(BatchResult {
+            upserted: entries.len(),
+            created,
+        })
+    }
 
-        let route = self
-            .cache
-            .try_get_with(key.into_boxed_str(), init)
+    pub async fn remove(&self, key: &RoutingKey) -> Result<bool> {
+        let existed = self.store.remove(key.as_str()).await?;
+        self.cache.remove(key.as_str());
+        Ok(existed)
+    }
+
+    pub fn invalidate(&self, key: &RoutingKey) {
+        self.cache.remove(key.as_str());
+    }
+
+    pub fn store_listable(&self) -> bool {
+        self.store.listable()
+    }
+
+    pub async fn list(&self, prefix: &str, cursor: Option<&str>, limit: usize) -> Result<Page> {
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        self.bounded(self.store.list(prefix, cursor, limit)).await
+    }
+
+    pub async fn count(&self) -> Result<Option<u64>> {
+        self.bounded(self.store.count()).await
+    }
+
+    pub async fn count_by_destination(&self) -> Result<Option<DestCounts>> {
+        self.bounded(self.store.count_by_destination(&self.ids))
             .await
-            .unwrap_or(Route::Transient);
-        route.dest(default)
-    }
-
-    pub fn normalize(&self, identifier: &str) -> String {
-        normalize_key(identifier, self.normalize)
-    }
-
-    pub async fn invalidate(&self, identifier: &str) {
-        let key = normalize_key(identifier, self.normalize);
-        self.cache.invalidate(key.as_str()).await;
     }
 
     pub fn invalidate_all(&self) {
-        self.cache.invalidate_all();
+        self.cache.clear();
     }
 
     pub async fn reload(&self) -> Result<()> {
         self.store.reload().await
     }
 
-    pub fn mapped_destinations(&self) -> Vec<String> {
+    pub async fn prepare_reload(&self) -> Result<Option<PendingMappings>> {
+        self.store.prepare_reload().await
+    }
+
+    pub fn install(&self, pending: PendingMappings) {
+        if self.store.install(pending) {
+            self.cache.clear();
+        }
+    }
+
+    pub fn mapped_destinations(&self) -> Vec<Arc<str>> {
         self.store.mapped_destinations()
     }
 
@@ -251,104 +453,18 @@ impl Router {
         self.valid_destinations.is_empty() || self.valid_destinations.contains(dest)
     }
 
-    pub async fn upsert(&self, identifier: &str, dest: &str) -> Result<()> {
-        if !self.is_valid_destination(dest) {
-            return Err(ProxyError::config(format!("unknown destination {dest:?}")));
-        }
-        let key = normalize_key(identifier, self.normalize);
-        self.store.upsert(&key, dest).await?;
-        self.cache.invalidate(key.as_str()).await;
-        Ok(())
-    }
-
-    pub async fn remove(&self, identifier: &str) -> Result<bool> {
-        let key = normalize_key(identifier, self.normalize);
-        let existed = self.store.remove(&key).await?;
-        self.cache.invalidate(key.as_str()).await;
-        Ok(existed)
-    }
-
-    pub async fn diagnose(&self, identifier: &str) -> MappingDiagnosis {
-        let key = normalize_key(identifier, self.normalize);
-        let cached = self.cache.get(key.as_str()).await.is_some();
-        let destination = self.resolve(Some(identifier)).await;
-        let routed_to_default = destination == self.default_destination;
-        MappingDiagnosis {
-            normalized: key,
-            destination: destination.to_string(),
-            routed_to_default,
-            cached,
-        }
-    }
-
     pub fn cache_entries(&self) -> u64 {
-        self.cache.entry_count()
-    }
-
-    #[cfg(test)]
-    pub async fn cache_entry_count(&self) -> u64 {
-        self.cache.run_pending_tasks().await;
-        self.cache.entry_count()
+        u64::try_from(self.cache.len()).unwrap_or(u64::MAX)
     }
 }
 
-async fn build_store(mapping: &MappingConfig, valid_destinations: Vec<String>) -> Result<Store> {
-    let valid = valid_destinations.into_iter().collect();
-    let store =
-        match mapping.source {
-            MappingSource::File => {
-                let cfg = mapping.file.as_ref().ok_or_else(|| {
-                    ProxyError::config("mapping.source=file requires [mapping.file]")
-                })?;
-                MappingStore::File(FileStore::open(cfg.path.clone(), mapping.normalize, valid)?)
-            }
-            MappingSource::Redis => {
-                let cfg = mapping.redis.as_ref().ok_or_else(|| {
-                    ProxyError::config("mapping.source=redis requires [mapping.redis]")
-                })?;
-                MappingStore::Redis(RedisStore::connect(cfg).await?)
-            }
-            MappingSource::Sql => {
-                let cfg = mapping.sql.as_ref().ok_or_else(|| {
-                    ProxyError::config("mapping.source=sql requires [mapping.sql]")
-                })?;
-                MappingStore::Sql(SqlStore::connect(cfg).await?)
-            }
-        };
-    Ok(Arc::new(store))
-}
 
-#[cfg(test)]
-mod tests {
-    use super::master_account;
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../../proxy-tests/unit/src/route/tests.rs"]
+mod tests;
 
-    #[test]
-    fn master_account_splits_on_first_separator() {
-        let seps = vec!["%".to_string()];
-        assert_eq!(
-            master_account("user@example.com%admin", &seps),
-            "user@example.com"
-        );
-        assert_eq!(
-            master_account("user@example.com", &seps),
-            "user@example.com"
-        );
-    }
-
-    #[test]
-    fn master_account_tries_multiple_separators() {
-        let seps = vec!["%".to_string(), "*".to_string()];
-        assert_eq!(master_account("alice*master", &seps), "alice");
-        assert_eq!(master_account("bob%root", &seps), "bob");
-        assert_eq!(master_account("a%b*c", &seps), "a");
-    }
-
-    #[test]
-    fn master_account_ignores_empty_separator() {
-        let seps = vec![String::new()];
-        assert_eq!(
-            master_account("user@example.com", &seps),
-            "user@example.com"
-        );
-    }
-}
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../../proxy-tests/unit/src/route/test_support.rs"]
+mod test_support;

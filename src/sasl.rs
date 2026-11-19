@@ -4,213 +4,136 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::borrow::Cow;
+use std::str;
+
 use encodify::base64::{self, Base64};
+use serde::{Serialize, Serializer};
 
 pub const SASL_RESPONSE: Base64 = base64::LENIENT;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SaslMech {
+    Plain,
+    Login,
+    OAuthBearer,
+    XOAuth2,
+}
+
+impl SaslMech {
+    pub fn parse(name: &[u8]) -> Option<Self> {
+        hashify::map_ignore_case!(
+            name,
+            SaslMech,
+            "PLAIN" => SaslMech::Plain,
+            "LOGIN" => SaslMech::Login,
+            "OAUTHBEARER" => SaslMech::OAuthBearer,
+            "XOAUTH2" => SaslMech::XOAuth2,
+        )
+        .copied()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SaslMech::Plain => "PLAIN",
+            SaslMech::Login => "LOGIN",
+            SaslMech::OAuthBearer => "OAUTHBEARER",
+            SaslMech::XOAuth2 => "XOAUTH2",
+        }
+    }
+
+    pub fn is_cleartext(self) -> bool {
+        matches!(self, SaslMech::Plain | SaslMech::Login)
+    }
+}
+
+impl Serialize for SaslMech {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+const AUTH_BEARER: &[u8] = b"auth=Bearer ";
+const XOAUTH2_USER: &[u8] = b"user=";
+const GS2_AUTHZID: &[u8] = b"a=";
+const KV_SEPARATOR: u8 = 0x01;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Credential {
-    Plain {
-        authcid: String,
-        passwd: String,
-    },
-    OAuth {
-        username: Option<String>,
-        token: String,
-    },
+pub enum Credential<'a> {
+    Plain { authcid: &'a str, passwd: &'a str },
+    OAuth(OAuthFrame<'a>),
 }
 
-impl Credential {
-    pub fn decode_sasl_challenge_plain(challenge: &[u8]) -> Option<Self> {
-        let mut username = Vec::new();
-        let mut secret = Vec::new();
-        let mut arg_num = 0;
-        for &ch in challenge {
-            if ch != 0 {
-                if arg_num == 1 {
-                    username.push(ch);
-                } else if arg_num == 2 {
-                    secret.push(ch);
-                }
-            } else {
-                arg_num += 1;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthFrame<'a> {
+    pub authzid: Option<Cow<'a, str>>,
+    pub token: &'a str,
+}
+
+impl<'a> Credential<'a> {
+    pub fn plain(response: &'a [u8]) -> Option<Self> {
+        let mut fields = response.split(|&b| b == 0).skip(1);
+        let authcid = str::from_utf8(fields.next()?).ok()?;
+        let passwd = str::from_utf8(fields.next()?).ok()?;
+        (!authcid.is_empty() && !passwd.is_empty()).then_some(Credential::Plain { authcid, passwd })
+    }
+
+    pub fn oauth(response: &'a [u8]) -> Option<Self> {
+        OAuthFrame::parse(response).map(Credential::OAuth)
+    }
+}
+
+impl<'a> OAuthFrame<'a> {
+    pub fn parse(response: &'a [u8]) -> Option<Self> {
+        let mut authzid = None;
+        for (index, segment) in response.split(|&b| b == KV_SEPARATOR).enumerate() {
+            if let Some(token) = strip_prefix_ignore_case(segment, AUTH_BEARER) {
+                return Some(OAuthFrame {
+                    authzid,
+                    token: str::from_utf8(token).ok()?,
+                });
             }
+            if authzid.is_some() {
+                continue;
+            }
+            authzid = match strip_prefix_ignore_case(segment, XOAUTH2_USER) {
+                Some(user) => str::from_utf8(user).ok().map(Cow::Borrowed),
+                None if index == 0 => gs2_authzid(segment),
+                None => None,
+            };
         }
-
-        match (String::from_utf8(username), String::from_utf8(secret)) {
-            (Ok(username), Ok(secret)) if !username.is_empty() && !secret.is_empty() => {
-                Some(Credential::Plain {
-                    authcid: username,
-                    passwd: secret,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    pub fn decode_sasl_challenge_oauth(challenge: &[u8]) -> Option<Self> {
-        extract_oauth_bearer(challenge)
-            .map(|(token, username)| Credential::OAuth { username, token })
+        None
     }
 }
 
-pub fn extract_oauth_bearer(bytes: &[u8]) -> Option<(String, Option<String>)> {
-    let mut start_pos = 0;
-    let eof = bytes.len().saturating_sub(1);
-    let mut iter = bytes.iter().enumerate();
-    let mut a = None;
-
-    while let Some((pos, ch)) = iter.next() {
-        if *ch == b','
-            && bytes
-                .get(pos + 1..pos + 3)
-                .is_some_and(|s| s.eq_ignore_ascii_case(b"a="))
-        {
-            let from_pos = pos + 3;
-            let mut to_pos = from_pos;
-            for (pos, ch) in iter.by_ref() {
-                if *ch == b',' || *ch == 1 {
-                    to_pos = pos;
-                    break;
-                }
-            }
-
-            if to_pos > from_pos {
-                a = bytes
-                    .get(from_pos..to_pos)
-                    .and_then(|s| std::str::from_utf8(s).ok())
-                    .filter(|v| v.contains('@'));
-            }
-        } else {
-            let is_separator = *ch == 1;
-            if is_separator || pos == eof {
-                if bytes
-                    .get(start_pos..start_pos + 12)
-                    .is_some_and(|s| s.eq_ignore_ascii_case(b"auth=Bearer "))
-                {
-                    return bytes
-                        .get(start_pos + 12..if is_separator { pos } else { bytes.len() })
-                        .and_then(|s| std::str::from_utf8(s).ok())
-                        .map(|token| (token.to_string(), a.map(|s| s.to_string())));
-                }
-
-                start_pos = pos + 1;
-            }
-        }
-    }
-
-    None
+fn gs2_authzid(header: &[u8]) -> Option<Cow<'_, str>> {
+    let field = header.split(|&b| b == b',').nth(1)?;
+    let name = strip_prefix_ignore_case(field, GS2_AUTHZID)?;
+    decode_saslname(str::from_utf8(name).ok()?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plain_extracts_authcid() {
-        let challenge = b"\0test\0secret";
-        let cred = Credential::decode_sasl_challenge_plain(challenge).unwrap();
-        assert_eq!(
-            cred,
-            Credential::Plain {
-                authcid: "test".into(),
-                passwd: "secret".into()
-            }
-        );
+fn decode_saslname(name: &str) -> Option<Cow<'_, str>> {
+    if !name.contains('=') {
+        return Some(Cow::Borrowed(name));
     }
-
-    #[test]
-    fn plain_rejects_empty() {
-        assert!(Credential::decode_sasl_challenge_plain(b"\0\0").is_none());
-        assert!(Credential::decode_sasl_challenge_plain(b"\0user\0").is_none());
+    let mut decoded = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some((head, tail)) = rest.split_once('=') {
+        decoded.push_str(head);
+        let (escape, tail) = tail.split_at_checked(2)?;
+        decoded.push(hashify::map!(escape.as_bytes(), char, "2C" => ',', "3D" => '=').copied()?);
+        rest = tail;
     }
-
-    #[test]
-    fn test_extract_oauth_bearer() {
-        assert_eq!(
-            extract_oauth_bearer(b"auth=Bearer validtoken"),
-            Some(("validtoken".to_string(), None))
-        );
-        assert_eq!(extract_oauth_bearer(b"auth=Invalid validtoken"), None);
-        assert_eq!(extract_oauth_bearer(b"auth=Bearer"), None);
-        assert_eq!(extract_oauth_bearer(b""), None);
-        assert_eq!(
-            extract_oauth_bearer(b"auth=Bearer token1\x01auth=Bearer token2"),
-            Some(("token1".to_string(), None))
-        );
-        assert_eq!(
-            extract_oauth_bearer(b"auth=Bearer token with spaces"),
-            Some(("token with spaces".to_string(), None))
-        );
-        let input = "n,a=user@example.com,\x01host=server.example.com\x01port=143\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhbHRhdmlzdGEuY29tCg==\x01\x01";
-        assert_eq!(
-            extract_oauth_bearer(input.as_bytes()),
-            Some((
-                "vF9dft4qmTc2Nvb3RlckBhbHRhdmlzdGEuY29tCg==".to_string(),
-                Some("user@example.com".to_string())
-            ))
-        );
-    }
-
-    #[test]
-    fn lenient_ir_decode() {
-        let out = SASL_RESPONSE.decode(b"dGVzdAB0ZXN0AHRlc3Q=").unwrap();
-        assert_eq!(out, b"test\0test\0test");
-    }
-
-    #[test]
-    fn plain_with_authzid_takes_authcid() {
-        let challenge = b"admin\0alice\0secret";
-        let cred = Credential::decode_sasl_challenge_plain(challenge).unwrap();
-        assert_eq!(
-            cred,
-            Credential::Plain {
-                authcid: "alice".into(),
-                passwd: "secret".into()
-            }
-        );
-    }
-
-    #[test]
-    fn oauth_wrapper_returns_credential() {
-        let input = "n,a=u@x,\x01auth=Bearer tok\x01\x01";
-        let cred = Credential::decode_sasl_challenge_oauth(input.as_bytes()).unwrap();
-        assert_eq!(
-            cred,
-            Credential::OAuth {
-                username: Some("u@x".into()),
-                token: "tok".into()
-            }
-        );
-    }
-
-    #[test]
-    fn xoauth2_frame_extracts_token() {
-        let input = "user=u@x\x01auth=Bearer xtok\x01\x01";
-        assert_eq!(
-            extract_oauth_bearer(input.as_bytes()),
-            Some(("xtok".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn oauth_a_field_requires_at_sign() {
-        let input = "n,a=plainuser,\x01auth=Bearer tok\x01\x01";
-        assert_eq!(
-            extract_oauth_bearer(input.as_bytes()),
-            Some(("tok".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn lenient_ir_tolerates_whitespace() {
-        let with_ws = SASL_RESPONSE.decode(b"dGVz dAB0\nZXN0AHRlc3Q=").unwrap();
-        assert_eq!(with_ws, b"test\0test\0test");
-    }
-
-    #[test]
-    fn lenient_ir_decodes_full_quads_without_padding() {
-        let out = SASL_RESPONSE.decode(b"AHRlc3QAc2VjcmV0").unwrap();
-        assert_eq!(out, b"\0test\0secret");
-    }
+    decoded.push_str(rest);
+    Some(Cow::Owned(decoded))
 }
+
+fn strip_prefix_ignore_case<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = bytes.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../proxy-tests/unit/src/sasl/tests.rs"]
+mod tests;

@@ -1,5 +1,5 @@
 # ===========================================================================
-# Migration proxy: Dovecot + Postfix to Stalwart sample configuration.
+# Stalwart Proxy: Dovecot + Postfix to Stalwart sample configuration.
 #
 # This configuration fronts a legacy mail stack (Dovecot serving IMAP, POP3 and
 # ManageSieve, Postfix handling SMTP submission) and a new Stalwart server at the
@@ -28,8 +28,8 @@ log_level = "info"
 
 # TLS certificate the proxy presents to clients (the public hostname's cert).
 [tls.certificate.default]
-cert = "/etc/proxy/tls/fullchain.pem"  # CHANGE ME
-key = "/etc/proxy/tls/privkey.pem"     # CHANGE ME
+cert = "/etc/proxy/certs/fullchain.pem"  # CHANGE ME
+key = "/etc/proxy/certs/privkey.pem"     # CHANGE ME
 default = true
 
 [tls.protocols]
@@ -61,7 +61,7 @@ negative_ttl = "30s"
 # line pointing it at "stalwart"; everything else falls through to "legacy". For
 # example:
 #   alice@example.com   stalwart
-path = "/etc/proxy/mappings.tsv"       # CHANGE ME
+path = "/etc/proxy/mappings/mappings.tsv"  # CHANGE ME
 
 # ---------------------------------------------------------------------------
 # Legacy Dovecot + Postfix backend. Announced to the backend over XCLIENT and the
@@ -177,7 +177,7 @@ tls = "plain"
 [admin]
 bind = "127.0.0.1:9443"
 tls = "implicit"
-bearer_token_file = "/etc/proxy/admin.token"  # CHANGE ME
+bearer_token_file = "/etc/proxy/admin-token"  # CHANGE ME
 min_token_len = 32
 lockout_threshold = 5
 lockout_duration = "5m"

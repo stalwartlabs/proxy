@@ -4,104 +4,63 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::borrow::Cow;
+use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use rustls::pki_types::ServerName;
+use rustls::{CipherSuite, ClientConfig, ProtocolVersion};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
-pub trait SessionStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
-    fn is_tls(&self) -> bool;
-    fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>);
-}
+use crate::error::{ErrorKind, ProxyError, Result, Side, Stage};
+use crate::net::linebuf::LineBuf;
 
-pub type BoxedStream = Box<dyn SessionStream>;
-
-impl SessionStream for TcpStream {
-    fn is_tls(&self) -> bool {
-        false
-    }
-
-    fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>) {
-        (Cow::Borrowed(""), Cow::Borrowed(""))
-    }
-}
-
-impl SessionStream for BoxedStream {
-    fn is_tls(&self) -> bool {
-        (**self).is_tls()
-    }
-
-    fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>) {
-        (**self).tls_version_and_cipher()
-    }
-}
-
-fn protocol_version_str(v: Option<rustls::ProtocolVersion>) -> Cow<'static, str> {
-    Cow::Borrowed(match v {
-        Some(rustls::ProtocolVersion::SSLv2) => "SSLv2",
-        Some(rustls::ProtocolVersion::SSLv3) => "SSLv3",
-        Some(rustls::ProtocolVersion::TLSv1_0) => "TLSv1.0",
-        Some(rustls::ProtocolVersion::TLSv1_1) => "TLSv1.1",
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-        _ => "unknown",
-    })
-}
-
-fn cipher_str(cs: Option<rustls::SupportedCipherSuite>) -> Cow<'static, str> {
-    Cow::Borrowed(cs.and_then(|c| c.suite().as_str()).unwrap_or("unknown"))
-}
-
-macro_rules! impl_tls_stream {
-    ($side:path) => {
-        impl<T: SessionStream> SessionStream for $side {
-            fn is_tls(&self) -> bool {
-                true
-            }
-
-            fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>) {
-                let (_, conn) = self.get_ref();
-                (
-                    protocol_version_str(conn.protocol_version()),
-                    cipher_str(conn.negotiated_cipher_suite()),
-                )
-            }
-        }
-    };
-}
-
-impl_tls_stream!(tokio_rustls::server::TlsStream<T>);
-impl_tls_stream!(tokio_rustls::client::TlsStream<T>);
-
-pub struct PrefacedStream<IO> {
-    prefix: Vec<u8>,
-    pos: usize,
+pub struct Prefaced<IO> {
+    prefix: Option<Box<Prefix>>,
     io: IO,
 }
 
-impl<IO> PrefacedStream<IO> {
-    pub fn new(prefix: Vec<u8>, io: IO) -> Self {
-        PrefacedStream { prefix, pos: 0, io }
+struct Prefix {
+    data: Box<[u8]>,
+    pos: usize,
+}
+
+impl<IO> Prefaced<IO> {
+    pub fn new(io: IO) -> Self {
+        Prefaced { prefix: None, io }
+    }
+
+    pub fn with_prefix(prefix: Vec<u8>, io: IO) -> Self {
+        let prefix = (!prefix.is_empty()).then(|| {
+            Box::new(Prefix {
+                data: prefix.into_boxed_slice(),
+                pos: 0,
+            })
+        });
+        Prefaced { prefix, io }
     }
 }
 
-impl<IO: AsyncRead + Unpin> AsyncRead for PrefacedStream<IO> {
+impl<IO: AsyncRead + Unpin> AsyncRead for Prefaced<IO> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        if me.pos < me.prefix.len() {
-            let remaining = &me.prefix[me.pos..];
+        if let Some(prefix) = &mut me.prefix {
+            let remaining = prefix.data.get(prefix.pos..).unwrap_or_default();
             let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            me.pos += n;
-            if me.pos == me.prefix.len() {
-                me.prefix = Vec::new();
-                me.pos = 0;
+            let (head, rest) = remaining.split_at(n);
+            buf.put_slice(head);
+            if rest.is_empty() {
+                me.prefix = None;
+            } else {
+                prefix.pos += n;
             }
             return Poll::Ready(Ok(()));
         }
@@ -109,30 +68,297 @@ impl<IO: AsyncRead + Unpin> AsyncRead for PrefacedStream<IO> {
     }
 }
 
-impl<IO: AsyncWrite + Unpin> AsyncWrite for PrefacedStream<IO> {
+impl<IO: AsyncWrite + Unpin> AsyncWrite for Prefaced<IO> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
 
-impl<IO: SessionStream> SessionStream for PrefacedStream<IO> {
-    fn is_tls(&self) -> bool {
-        false
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsInfo {
+    pub version: ProtocolVersion,
+    pub cipher: CipherSuite,
+}
+
+impl TlsInfo {
+    fn from_conn(conn: &rustls::CommonState) -> Option<Self> {
+        Some(TlsInfo {
+            version: conn.protocol_version()?,
+            cipher: conn.negotiated_cipher_suite()?.suite(),
+        })
     }
 
-    fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>) {
-        (Cow::Borrowed(""), Cow::Borrowed(""))
+    pub fn version_str(&self) -> &'static str {
+        match self.version {
+            ProtocolVersion::TLSv1_2 => "TLSv1.2",
+            ProtocolVersion::TLSv1_3 => "TLSv1.3",
+            ProtocolVersion::TLSv1_1 => "TLSv1.1",
+            ProtocolVersion::TLSv1_0 => "TLSv1.0",
+            _ => "unknown",
+        }
+    }
+
+    pub fn cipher_str(&self) -> &'static str {
+        self.cipher.as_str().unwrap_or("unknown")
+    }
+}
+
+pub enum ClientStream {
+    Plain(Prefaced<TcpStream>),
+    Tls(Box<server::TlsStream<Prefaced<TcpStream>>>),
+}
+
+const _: () = assert!(size_of::<ClientStream>() <= 48);
+
+impl From<TcpStream> for ClientStream {
+    fn from(tcp: TcpStream) -> Self {
+        ClientStream::Plain(Prefaced::new(tcp))
+    }
+}
+
+impl From<Prefaced<TcpStream>> for ClientStream {
+    fn from(io: Prefaced<TcpStream>) -> Self {
+        ClientStream::Plain(io)
+    }
+}
+
+impl ClientStream {
+    pub fn is_tls(&self) -> bool {
+        matches!(self, ClientStream::Tls(_))
+    }
+
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        match self {
+            ClientStream::Plain(_) => None,
+            ClientStream::Tls(tls) => TlsInfo::from_conn(tls.get_ref().1),
+        }
+    }
+
+    pub async fn accept_tls(self, acceptor: &TlsAcceptor) -> Result<Self> {
+        let ClientStream::Plain(io) = self else {
+            return Err(ProxyError::already_tls());
+        };
+        acceptor
+            .accept(io)
+            .await
+            .map(|tls| ClientStream::Tls(Box::new(tls)))
+            .map_err(|e| ProxyError::io(Stage::InboundTls, Side::Client, e))
+    }
+
+    pub async fn upgrade(self, acceptor: &TlsAcceptor, buf: &mut LineBuf) -> Result<Self> {
+        buf.clear();
+        self.accept_tls(acceptor).await
+    }
+
+    pub async fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        send_all(self, bytes, Stage::Preauth, Side::Client).await
+    }
+}
+
+pub enum BackendStream {
+    Plain(TcpStream),
+    Tls(Box<client::TlsStream<TcpStream>>),
+}
+
+const _: () = assert!(size_of::<BackendStream>() <= 40);
+
+impl From<TcpStream> for BackendStream {
+    fn from(tcp: TcpStream) -> Self {
+        BackendStream::Plain(tcp)
+    }
+}
+
+impl BackendStream {
+    pub fn is_tls(&self) -> bool {
+        matches!(self, BackendStream::Tls(_))
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            BackendStream::Plain(tcp) => tcp.peer_addr(),
+            BackendStream::Tls(tls) => tls.get_ref().0.peer_addr(),
+        }
+    }
+
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        match self {
+            BackendStream::Plain(_) => None,
+            BackendStream::Tls(tls) => TlsInfo::from_conn(tls.get_ref().1),
+        }
+    }
+
+    pub async fn connect_tls(
+        self,
+        config: &Arc<ClientConfig>,
+        name: Option<&ServerName<'static>>,
+    ) -> Result<Self> {
+        let name = name.ok_or_else(ProxyError::no_server_name)?;
+        self.handshake(config, name).await
+    }
+
+    async fn handshake(
+        self,
+        config: &Arc<ClientConfig>,
+        name: &ServerName<'static>,
+    ) -> Result<Self> {
+        let BackendStream::Plain(tcp) = self else {
+            return Err(ProxyError::already_tls());
+        };
+        TlsConnector::from(config.clone())
+            .connect(name.clone(), tcp)
+            .await
+            .map(|tls| BackendStream::Tls(Box::new(tls)))
+            .map_err(|e| ProxyError::io(Stage::BackendTls, Side::Backend, e))
+    }
+
+    pub async fn upgrade(
+        self,
+        config: &Arc<ClientConfig>,
+        name: Option<&ServerName<'static>>,
+        buf: &LineBuf,
+    ) -> Result<Self> {
+        let name = name.ok_or_else(ProxyError::no_server_name)?;
+        if !buf.data().is_empty() {
+            return Err(ProxyError::plaintext_after_starttls());
+        }
+        self.handshake(config, name).await
+    }
+
+    pub async fn send(&mut self, bytes: &[u8], stage: Stage) -> Result<()> {
+        send_all(self, bytes, stage, Side::Backend).await
+    }
+}
+
+async fn send_all<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+    stage: Stage,
+    side: Side,
+) -> Result<()> {
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|e| ProxyError::io(stage, side, e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| ProxyError::io(stage, side, e))
+}
+
+macro_rules! dispatch_io {
+    ($ty:ident) => {
+        impl AsyncRead for $ty {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                match self.get_mut() {
+                    $ty::Plain(s) => Pin::new(s).poll_read(cx, buf),
+                    $ty::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+                }
+            }
+        }
+
+        impl AsyncWrite for $ty {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                match self.get_mut() {
+                    $ty::Plain(s) => Pin::new(s).poll_write(cx, buf),
+                    $ty::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+                }
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                match self.get_mut() {
+                    $ty::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+                    $ty::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+                }
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                match self {
+                    $ty::Plain(s) => s.is_write_vectored(),
+                    $ty::Tls(s) => s.is_write_vectored(),
+                }
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                match self.get_mut() {
+                    $ty::Plain(s) => Pin::new(s).poll_flush(cx),
+                    $ty::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+                }
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                match self.get_mut() {
+                    $ty::Plain(s) => Pin::new(s).poll_shutdown(cx),
+                    $ty::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+                }
+            }
+        }
+    };
+}
+
+dispatch_io!(ClientStream);
+dispatch_io!(BackendStream);
+impl ProxyError {
+    #[cold]
+    #[inline(never)]
+    fn already_tls() -> ProxyError {
+        ProxyError::new(
+            Stage::Starttls,
+            Side::Client,
+            ErrorKind::Protocol("stream is already TLS".into()),
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn no_server_name() -> ProxyError {
+        ProxyError::unavailable(
+            Stage::BackendTls,
+            "destination has no valid TLS server name (set tls_server_name)",
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn plaintext_after_starttls() -> ProxyError {
+        ProxyError::unavailable(
+            Stage::Starttls,
+            "backend sent data after its STARTTLS reply",
+        )
     }
 }

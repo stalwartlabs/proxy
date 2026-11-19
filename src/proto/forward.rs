@@ -4,33 +4,116 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::fmt::{self, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::BitOr;
 
-use crate::config::{DestProtocol, DestinationConfig, Forwarding};
-use crate::error::{ProxyError, Result};
-use crate::net::BoxedStream;
-use crate::outbound;
-use crate::proto::common::advertises_token;
+use tokio::net::TcpStream;
 
+use crate::config::{Forwarding, Protocol};
+use crate::error::{ProxyError, Result, Stage};
+use crate::net::dial::Peers;
+use crate::proto::backend::{EncryptedLeg, starts_with_ci};
+use crate::runtime::destination::{Destination, Endpoint};
+use crate::token::valid_routing_identifier;
+
+const MAX_ID_REPLY_LINES: usize = 16;
 const CLIENT_TRANSPORT_TLS: &str = "TLS";
 const CLIENT_TRANSPORT_INSECURE: &str = "insecure";
+const COMMAND_CAPACITY: usize = 256;
 
-pub struct ForwardInfo {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XclientAttrs(u16);
+
+impl XclientAttrs {
+    pub const ADDR: Self = XclientAttrs(1);
+    pub const PORT: Self = XclientAttrs(1 << 1);
+    pub const DESTADDR: Self = XclientAttrs(1 << 2);
+    pub const DESTPORT: Self = XclientAttrs(1 << 3);
+    pub const SESSION: Self = XclientAttrs(1 << 4);
+    pub const TTL: Self = XclientAttrs(1 << 5);
+    pub const CLIENT_TRANSPORT: Self = XclientAttrs(1 << 6);
+    pub const HELO: Self = XclientAttrs(1 << 7);
+    pub const PROTO: Self = XclientAttrs(1 << 8);
+    pub const ALL: Self = XclientAttrs((1 << 9) - 1);
+    const MAIL: Self = XclientAttrs(Self::ALL.0 & !Self::HELO.0 & !Self::PROTO.0);
+
+    pub fn parse<'a>(names: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        names
+            .into_iter()
+            .fold(XclientAttrs::default(), |attrs, name| {
+                match hashify::map_ignore_case!(
+                    name,
+                    XclientAttrs,
+                    "ADDR" => XclientAttrs::ADDR,
+                    "PORT" => XclientAttrs::PORT,
+                    "DESTADDR" => XclientAttrs::DESTADDR,
+                    "DESTPORT" => XclientAttrs::DESTPORT,
+                    "SESSION" => XclientAttrs::SESSION,
+                    "TTL" => XclientAttrs::TTL,
+                    "CLIENT-TRANSPORT" => XclientAttrs::CLIENT_TRANSPORT,
+                    "HELO" => XclientAttrs::HELO,
+                    "PROTO" => XclientAttrs::PROTO,
+                ) {
+                    Some(attr) => attrs | *attr,
+                    None => attrs,
+                }
+            })
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn has(self, attr: XclientAttrs) -> bool {
+        self.0 & attr.0 != 0
+    }
+}
+
+impl BitOr for XclientAttrs {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        XclientAttrs(self.0 | rhs.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XclientDialect {
+    Mail,
+    Smtp(XclientAttrs),
+}
+
+struct XclientAddr {
+    ip: IpAddr,
+    smtp: bool,
+}
+
+impl fmt::Display for XclientAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.ip {
+            IpAddr::V6(v6) if self.smtp => write!(f, "IPV6:{v6}"),
+            ip => ip.fmt(f),
+        }
+    }
+}
+
+pub struct ForwardInfo<'a> {
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub client_tls: bool,
-    pub helo: Option<String>,
-    pub session: String,
+    pub helo: Option<&'a str>,
+    pub session: u64,
     pub ttl: u32,
 }
 
-impl ForwardInfo {
+impl<'a> ForwardInfo<'a> {
     pub fn new(
         peer: SocketAddr,
         local: SocketAddr,
         client_tls: bool,
-        helo: Option<String>,
+        helo: Option<&'a str>,
+        session: u64,
         inbound_ttl: u32,
     ) -> Self {
         ForwardInfo {
@@ -38,8 +121,15 @@ impl ForwardInfo {
             local,
             client_tls,
             helo,
-            session: new_session_id(),
+            session,
             ttl: inbound_ttl.saturating_sub(1),
+        }
+    }
+
+    pub fn peers(&self) -> Peers {
+        Peers {
+            peer: self.peer,
+            local: self.local,
         }
     }
 
@@ -50,271 +140,216 @@ impl ForwardInfo {
             CLIENT_TRANSPORT_INSECURE
         }
     }
-}
 
-fn new_session_id() -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("P{n:x}")
-}
-
-pub fn guard_loop(
-    self_binds: &ahash::AHashSet<SocketAddr>,
-    dest: &DestinationConfig,
-    ep: &DestProtocol,
-    forwarding: Forwarding,
-    inbound_ttl: u32,
-) -> Result<()> {
-    if let Ok(ip) = dest.host.parse::<IpAddr>()
-        && self_binds.contains(&SocketAddr::new(ip, ep.port))
-    {
-        return Err(ProxyError::backend(
-            "proxying loop: destination is one of our own listeners",
-        ));
-    }
-    if forwarding == Forwarding::Xclient && inbound_ttl <= 1 {
-        return Err(ProxyError::backend(
-            "proxying loop: forwarded TTL exhausted",
-        ));
-    }
-    Ok(())
-}
-
-fn addr_for_smtp(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("IPV6:{v6}"),
-    }
-}
-
-pub fn imap_id_fields(fwd: &ForwardInfo) -> String {
-    format!(
-        "(\"x-originating-ip\" \"{}\" \"x-originating-port\" \"{}\" \
-         \"x-connected-ip\" \"{}\" \"x-connected-port\" \"{}\" \
-         \"x-proxy-ttl\" \"{}\" \"x-session-id\" \"{}\" \
-         \"x-client-transport\" \"{}\")",
-        fwd.peer.ip(),
-        fwd.peer.port(),
-        fwd.local.ip(),
-        fwd.local.port(),
-        fwd.ttl,
-        fwd.session,
-        fwd.transport(),
-    )
-}
-
-fn xclient_pairs(fwd: &ForwardInfo, smtp: bool) -> Vec<(&'static str, String)> {
-    let (addr, destaddr) = if smtp {
-        (addr_for_smtp(fwd.peer.ip()), addr_for_smtp(fwd.local.ip()))
-    } else {
-        (fwd.peer.ip().to_string(), fwd.local.ip().to_string())
-    };
-    let mut pairs = vec![
-        ("ADDR", addr),
-        ("PORT", fwd.peer.port().to_string()),
-        ("DESTADDR", destaddr),
-        ("DESTPORT", fwd.local.port().to_string()),
-        ("SESSION", fwd.session.clone()),
-        ("TTL", fwd.ttl.to_string()),
-        ("CLIENT-TRANSPORT", fwd.transport().to_string()),
-    ];
-    if smtp {
-        if let Some(helo) = &fwd.helo
-            && !helo.is_empty()
-            && crate::token::valid_routing_identifier(helo)
-        {
-            pairs.push(("HELO", helo.clone()));
+    pub fn xclient_command(&self, dialect: XclientDialect) -> String {
+        let (attrs, smtp) = match dialect {
+            XclientDialect::Mail => (XclientAttrs::MAIL, false),
+            XclientDialect::Smtp(attrs) => (attrs, true),
+        };
+        let mut out = String::with_capacity(COMMAND_CAPACITY);
+        out.push_str("XCLIENT");
+        if attrs.has(XclientAttrs::ADDR) {
+            let addr = XclientAddr {
+                ip: self.peer.ip(),
+                smtp,
+            };
+            let _ = write!(out, " ADDR={addr}");
         }
-        pairs.push(("PROTO", "ESMTP".to_string()));
-    }
-    pairs
-}
-
-fn join_pairs(pairs: &[(&'static str, String)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn xclient_params(fwd: &ForwardInfo, smtp: bool) -> String {
-    join_pairs(&xclient_pairs(fwd, smtp))
-}
-
-pub fn xclient_params_advertised(fwd: &ForwardInfo, advertised: &[String]) -> String {
-    let pairs: Vec<(&'static str, String)> = xclient_pairs(fwd, true)
-        .into_iter()
-        .filter(|(k, _)| advertised.iter().any(|a| a.eq_ignore_ascii_case(k)))
-        .collect();
-    join_pairs(&pairs)
-}
-
-pub async fn send_imap_id(
-    backend: &mut BoxedStream,
-    residual: &mut Vec<u8>,
-    banner: &[u8],
-    fwd: &ForwardInfo,
-    max: usize,
-) -> Result<()> {
-    if !advertises_token(banner, "ID") {
-        return Ok(());
-    }
-    let cmd = format!("F1 ID {}\r\n", imap_id_fields(fwd));
-    outbound::write_all(backend, cmd.as_bytes()).await?;
-    for _ in 0..16 {
-        let line = outbound::read_line(backend, residual, max).await?;
-        if line
-            .trim_ascii_start()
-            .to_ascii_uppercase()
-            .starts_with(b"F1 ")
+        if attrs.has(XclientAttrs::PORT) {
+            let _ = write!(out, " PORT={}", self.peer.port());
+        }
+        if attrs.has(XclientAttrs::DESTADDR) {
+            let addr = XclientAddr {
+                ip: self.local.ip(),
+                smtp,
+            };
+            let _ = write!(out, " DESTADDR={addr}");
+        }
+        if attrs.has(XclientAttrs::DESTPORT) {
+            let _ = write!(out, " DESTPORT={}", self.local.port());
+        }
+        if attrs.has(XclientAttrs::SESSION) {
+            let _ = write!(out, " SESSION=P{:x}", self.session);
+        }
+        if attrs.has(XclientAttrs::TTL) {
+            let _ = write!(out, " TTL={}", self.ttl);
+        }
+        if attrs.has(XclientAttrs::CLIENT_TRANSPORT) {
+            let _ = write!(out, " CLIENT-TRANSPORT={}", self.transport());
+        }
+        if attrs.has(XclientAttrs::HELO)
+            && let Some(helo) = self.helo
+            && !helo.is_empty()
+            && valid_routing_identifier(helo)
         {
+            let _ = write!(out, " HELO={helo}");
+        }
+        if attrs.has(XclientAttrs::PROTO) {
+            out.push_str(" PROTO=ESMTP");
+        }
+        out.push_str("\r\n");
+        out
+    }
+
+    pub fn write_imap_id(&self, out: &mut String) {
+        let _ = write!(
+            out,
+            "(\"x-originating-ip\" \"{}\" \"x-originating-port\" \"{}\" \
+             \"x-connected-ip\" \"{}\" \"x-connected-port\" \"{}\" \
+             \"x-proxy-ttl\" \"{}\" \"x-session-id\" \"P{:x}\" \
+             \"x-client-transport\" \"{}\")",
+            self.peer.ip(),
+            self.peer.port(),
+            self.local.ip(),
+            self.local.port(),
+            self.ttl,
+            self.session,
+            self.transport(),
+        );
+    }
+}
+
+impl Destination {
+    pub fn warn_unadvertised(&self, protocol: Protocol) {
+        if self.warn_once_unadvertised() {
+            tracing::warn!(
+                destination = %self.name,
+                protocol = protocol.as_str(),
+                "forwarding = xclient but the backend does not advertise it; forwarding skipped"
+            );
+        }
+    }
+}
+
+pub struct LoopGuard {
+    binds: Box<[SocketAddr]>,
+    has_wildcard: bool,
+    proxy_ttl: u32,
+}
+
+impl LoopGuard {
+    pub fn new(binds: impl IntoIterator<Item = SocketAddr>, proxy_ttl: u32) -> Self {
+        let mut binds: Vec<SocketAddr> = binds.into_iter().collect();
+        binds.sort_unstable();
+        binds.dedup();
+        LoopGuard {
+            has_wildcard: binds.iter().any(|bind| bind.ip().is_unspecified()),
+            binds: binds.into_boxed_slice(),
+            proxy_ttl,
+        }
+    }
+
+    pub fn check_target(&self, ep: &Endpoint) -> Result<()> {
+        if let Some(addrs) = &ep.addrs
+            && addrs.iter().any(|addr| self.binds.contains(addr))
+        {
+            return Err(ProxyError::loop_detected(
+                "proxying loop: destination is one of our own listeners",
+            ));
+        }
+        if ep.forwarding == Forwarding::Xclient && self.proxy_ttl <= 1 {
+            return Err(ProxyError::loop_detected(
+                "proxying loop: forwarded TTL exhausted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn check_connected(&self, ep: &Endpoint, tcp: &TcpStream) -> Result<()> {
+        if ep.addrs.is_some() && !self.has_wildcard {
             return Ok(());
         }
-    }
-    Err(ProxyError::backend("backend ID reply was not tagged"))
-}
-
-pub async fn send_pop3_xclient(
-    backend: &mut BoxedStream,
-    residual: &mut Vec<u8>,
-    advertised: bool,
-    fwd: &ForwardInfo,
-    max: usize,
-) -> Result<()> {
-    if !advertised {
-        return Ok(());
-    }
-    let cmd = format!("XCLIENT {}\r\n", xclient_params(fwd, false));
-    outbound::write_all(backend, cmd.as_bytes()).await?;
-    let resp = outbound::read_line(backend, residual, max).await?;
-    if !resp.starts_with(b"+OK") {
-        return Err(ProxyError::backend("backend rejected XCLIENT"));
-    }
-    Ok(())
-}
-
-pub async fn send_managesieve_xclient(
-    backend: &mut BoxedStream,
-    residual: &mut Vec<u8>,
-    advertised: bool,
-    fwd: &ForwardInfo,
-    max: usize,
-) -> Result<()> {
-    if !advertised {
-        return Ok(());
-    }
-    let cmd = format!("XCLIENT {}\r\n", xclient_params(fwd, false));
-    outbound::write_all(backend, cmd.as_bytes()).await?;
-    let resp = outbound::read_line(backend, residual, max).await?;
-    if !resp.to_ascii_uppercase().starts_with(b"OK") {
-        return Err(ProxyError::backend("backend rejected XCLIENT"));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fwd() -> ForwardInfo {
-        ForwardInfo {
-            peer: "203.0.113.5:40000".parse().unwrap(),
-            local: "192.0.2.10:993".parse().unwrap(),
-            client_tls: true,
-            helo: Some("client.example".into()),
-            session: "Pdead".into(),
-            ttl: 6,
+        let (Ok(peer), Ok(local)) = (tcp.peer_addr(), tcp.local_addr()) else {
+            return Ok(());
+        };
+        let peer = canonical(peer);
+        let on_this_host = peer.ip().is_loopback() || peer.ip() == canonical(local).ip();
+        let hit = self.binds.iter().any(|bind| {
+            *bind == peer
+                || (on_this_host
+                    && bind.port() == peer.port()
+                    && wildcard_accepts(bind.ip(), peer.ip()))
+        });
+        if hit {
+            return Err(ProxyError::loop_detected(
+                "proxying loop: backend connection reached one of our own listeners",
+            ));
         }
-    }
-
-    #[test]
-    fn imap_id_has_core_fields() {
-        let s = imap_id_fields(&fwd());
-        assert!(s.contains("\"x-originating-ip\" \"203.0.113.5\""));
-        assert!(s.contains("\"x-proxy-ttl\" \"6\""));
-        assert!(s.contains("\"x-client-transport\" \"TLS\""));
-        assert!(s.starts_with('(') && s.ends_with(')'));
-    }
-
-    #[test]
-    fn xclient_pop3_omits_login_and_helo() {
-        let s = xclient_params(&fwd(), false);
-        assert!(s.contains("ADDR=203.0.113.5 PORT=40000"));
-        assert!(s.contains("CLIENT-TRANSPORT=TLS"));
-        assert!(!s.contains("LOGIN="));
-        assert!(!s.contains("HELO="));
-    }
-
-    #[test]
-    fn xclient_smtp_includes_helo_proto_and_v6_prefix_but_never_login() {
-        let mut f = fwd();
-        f.peer = "[2001:db8::5]:40000".parse().unwrap();
-        let s = xclient_params(&f, true);
-        assert!(s.contains("ADDR=IPV6:2001:db8::5"));
-        assert!(s.contains("HELO=client.example"));
-        assert!(s.contains("PROTO=ESMTP"));
-        assert!(
-            !s.contains("LOGIN="),
-            "LOGIN must not be forwarded: the proxy replays AUTH; XCLIENT LOGIN would pre-authenticate the backend"
-        );
-    }
-
-    #[test]
-    fn xclient_advertised_filters_unsupported_attributes() {
-        let advertised: Vec<String> = ["ADDR", "PORT", "HELO", "PROTO", "DESTADDR", "DESTPORT"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let s = xclient_params_advertised(&fwd(), &advertised);
-        assert!(s.contains("ADDR=203.0.113.5"));
-        assert!(s.contains("PROTO=ESMTP"));
-        assert!(!s.contains("SESSION="), "Postfix rejects SESSION: {s}");
-        assert!(!s.contains("TTL="), "Postfix rejects TTL: {s}");
-        assert!(
-            !s.contains("CLIENT-TRANSPORT="),
-            "Postfix rejects CLIENT-TRANSPORT: {s}"
-        );
-    }
-
-    #[test]
-    fn guard_loop_rejects_self_and_exhausted_ttl() {
-        use crate::config::{DestProtocol, TlsMode};
-        use ahash::AHashSet;
-
-        let mut binds = AHashSet::new();
-        binds.insert("127.0.0.1:993".parse().unwrap());
-
-        let mut dest: DestinationConfig = toml::from_str("host = \"127.0.0.1\"").expect("dest");
-        let ep = DestProtocol {
-            port: 993,
-            tls: TlsMode::Implicit,
-            forwarding: None,
-        };
-        assert!(guard_loop(&binds, &dest, &ep, Forwarding::Proxy, 7).is_err());
-
-        let ep2 = DestProtocol {
-            port: 143,
-            tls: TlsMode::Implicit,
-            forwarding: None,
-        };
-        assert!(guard_loop(&binds, &dest, &ep2, Forwarding::Proxy, 7).is_ok());
-
-        dest.host = "10.0.0.9".to_string();
-        assert!(guard_loop(&binds, &dest, &ep2, Forwarding::Xclient, 1).is_err());
-        assert!(guard_loop(&binds, &dest, &ep2, Forwarding::Proxy, 1).is_ok());
-    }
-
-    #[test]
-    fn ttl_decrements_on_construction() {
-        let f = ForwardInfo::new(
-            "203.0.113.5:40000".parse().unwrap(),
-            "192.0.2.10:993".parse().unwrap(),
-            false,
-            None,
-            7,
-        );
-        assert_eq!(f.ttl, 6);
-        assert_eq!(f.transport(), "insecure");
+        Ok(())
     }
 }
+
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+fn wildcard_accepts(bind: IpAddr, peer: IpAddr) -> bool {
+    match bind {
+        IpAddr::V4(v4) => v4.is_unspecified() && peer.is_ipv4(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
+impl ProxyError {
+    #[cold]
+    #[inline(never)]
+    fn loop_detected(msg: &'static str) -> ProxyError {
+        ProxyError::config(msg)
+    }
+}
+
+impl ForwardInfo<'_> {
+    pub async fn send_imap_id(&self, leg: &mut EncryptedLeg) -> Result<()> {
+        let mut cmd = String::with_capacity(COMMAND_CAPACITY);
+        cmd.push_str("F1 ID ");
+        self.write_imap_id(&mut cmd);
+        cmd.push_str("\r\n");
+        leg.send(cmd.as_bytes(), Stage::Forwarding).await?;
+        for _ in 0..MAX_ID_REPLY_LINES {
+            let line = leg.read_line(Stage::Forwarding).await?;
+            if starts_with_ci(line.trim_ascii_start(), b"F1 ") {
+                return Ok(());
+            }
+        }
+        Err(ProxyError::unavailable(
+            Stage::Forwarding,
+            "backend ID reply was not tagged",
+        ))
+    }
+
+    pub async fn send_pop3_xclient(&self, leg: &mut EncryptedLeg) -> Result<()> {
+        let cmd = self.xclient_command(XclientDialect::Mail);
+        leg.send(cmd.as_bytes(), Stage::Forwarding).await?;
+        if !leg.read_line(Stage::Forwarding).await?.starts_with(b"+OK") {
+            return Err(ProxyError::unavailable(
+                Stage::Forwarding,
+                "backend rejected XCLIENT",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn send_managesieve_xclient(&self, leg: &mut EncryptedLeg) -> Result<()> {
+        let cmd = self.xclient_command(XclientDialect::Mail);
+        leg.send(cmd.as_bytes(), Stage::Forwarding).await?;
+        let reply = leg.read_line(Stage::Forwarding).await?;
+        if !starts_with_ci(reply.trim_ascii_start(), b"OK") {
+            return Err(ProxyError::unavailable(
+                Stage::Forwarding,
+                "backend rejected XCLIENT",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../../proxy-tests/unit/src/proto/forward/tests.rs"]
+mod tests;

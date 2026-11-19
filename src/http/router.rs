@@ -4,46 +4,68 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::sync::Arc;
+use std::borrow::Cow;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use encodify::base64::STANDARD as BASE64;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use memchr::{memchr, memchr2};
+use percent_encoding::percent_decode_str;
 use regex::Regex;
 
 use crate::config::{ExtractFrom, HttpConfig, HttpExtract, HttpRoute};
-use crate::error::{ProxyError, Result};
-use crate::http::head::Head;
+use crate::error::ProxyError;
+use crate::http::head::{Head, HeaderKind};
+use crate::route::key::{KeyRules, RoutingKey};
+use crate::runtime::DestId;
 use crate::token::bearer_identifier;
 
+const BASIC: &[u8] = b"basic";
+const BEARER: &[u8] = b"bearer";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Extracted {
+    Missing,
+    Key(RoutingKey),
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOutcome {
-    Pin {
-        dest_id: String,
-    },
+    Pin(DestId),
     Identifier {
-        identifier: Option<String>,
-        fallback: Option<Arc<str>>,
+        key: Extracted,
+        fallback: Option<DestId>,
     },
 }
 
-struct CompiledExtract {
-    from: ExtractFrom,
-    regex: Option<Regex>,
-    param: Option<String>,
-    header: Option<String>,
+struct Ambiguous;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchError {
+    DotSegment,
 }
 
-struct CompiledRoute {
-    destination: Option<String>,
-    extract: Option<CompiledExtract>,
-    fallback: Option<Arc<str>>,
-    needs_body: bool,
+enum Extract {
+    Authorization,
+    Query { param: Box<str> },
+    Body { regex: Regex },
+    Header { name: Box<[u8]>, kind: HeaderKind },
+}
+
+enum CompiledRoute {
+    Pin(DestId),
+    Extract {
+        extract: Option<Extract>,
+        fallback: Option<DestId>,
+    },
 }
 
 pub struct HttpRouter {
     set: GlobSet,
-    routes: Vec<CompiledRoute>,
-    jwt_username_claim: String,
+    routes: Box<[CompiledRoute]>,
+    jwt_username_claim: Box<str>,
     pub body_extract_cap: usize,
     pub max_head_size: usize,
     pub relay_idle: Duration,
@@ -52,7 +74,11 @@ pub struct HttpRouter {
 }
 
 impl HttpRouter {
-    pub fn build(http: &HttpConfig, jwt_username_claim: String) -> Result<Self> {
+    pub fn build(
+        http: &HttpConfig,
+        jwt_username_claim: &str,
+        dest_names: &AHashMap<Box<str>, DestId>,
+    ) -> Result<Self, ProxyError> {
         let mut builder = GlobSetBuilder::new();
         let mut routes = Vec::with_capacity(http.route.len());
         for route in &http.route {
@@ -60,15 +86,15 @@ impl HttpRouter {
                 Glob::new(&route.match_glob)
                     .map_err(|e| ProxyError::config(format!("invalid http route glob: {e}")))?,
             );
-            routes.push(compile_route(route)?);
+            routes.push(CompiledRoute::build(route, dest_names)?);
         }
         let set = builder
             .build()
             .map_err(|e| ProxyError::config(format!("invalid http route set: {e}")))?;
         Ok(HttpRouter {
             set,
-            routes,
-            jwt_username_claim,
+            routes: routes.into_boxed_slice(),
+            jwt_username_claim: jwt_username_claim.into(),
             body_extract_cap: http.body_extract_cap,
             max_head_size: http.max_head_size,
             relay_idle: http.relay_idle,
@@ -77,363 +103,250 @@ impl HttpRouter {
         })
     }
 
-    pub fn match_index(&self, head: &Head) -> Option<usize> {
-        let path = head.path();
-        let raw = self.set.matches(path).into_iter().min();
+    pub fn match_index(
+        &self,
+        head: &Head,
+        scratch: &mut Vec<usize>,
+    ) -> Result<Option<usize>, MatchError> {
+        let path = normalize_path(head.path())?;
+        self.set.matches_into(path.as_ref(), scratch);
+        let mut best = scratch.iter().copied().min();
         let trimmed = path.trim_end_matches('/');
-        let normalized = if trimmed.len() != path.len() && !trimmed.is_empty() {
-            self.set.matches(trimmed).into_iter().min()
-        } else {
-            None
-        };
-        match (raw, normalized) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        if trimmed.len() != path.len() && !trimmed.is_empty() {
+            self.set.matches_into(trimmed, scratch);
+            best = best.into_iter().chain(scratch.iter().copied()).min();
         }
+        Ok(best)
     }
 
     pub fn needs_body_at(&self, idx: usize) -> bool {
-        self.routes[idx].needs_body
+        matches!(
+            self.routes.get(idx),
+            Some(CompiledRoute::Extract {
+                extract: Some(Extract::Body { .. }),
+                ..
+            })
+        )
     }
 
-    pub fn route_at(&self, idx: usize, head: &Head, body: Option<&[u8]>) -> RouteOutcome {
-        let route = &self.routes[idx];
-        if let Some(dest) = &route.destination {
-            return RouteOutcome::Pin {
-                dest_id: dest.clone(),
-            };
-        }
-        let identifier = match &route.extract {
-            Some(extract) => self.extract(extract, head, body),
-            None => None,
-        };
-        RouteOutcome::Identifier {
-            identifier,
-            fallback: route.fallback.clone(),
-        }
-    }
-
-    fn extract(
+    pub fn route_at(
         &self,
-        extract: &CompiledExtract,
+        idx: usize,
         head: &Head,
         body: Option<&[u8]>,
-    ) -> Option<String> {
-        match extract.from {
-            ExtractFrom::Authorization => self.extract_authorization(head),
-            ExtractFrom::Query => {
-                let param = extract.param.as_deref()?;
-                let query = head.query()?;
-                query_param(query, param)
-            }
-            ExtractFrom::Body => {
-                let re = extract.regex.as_ref()?;
-                let body = body?;
-                let text = std::str::from_utf8(body).ok()?;
-                let caps = re.captures(text)?;
-                let raw = caps.get(1)?.as_str();
-                Some(form_decode(raw))
-            }
-            ExtractFrom::Header => {
-                let name = extract.header.as_deref()?;
-                head.header(name).map(|v| v.to_string())
-            }
+        rules: &KeyRules,
+    ) -> RouteOutcome {
+        match self.routes.get(idx) {
+            Some(CompiledRoute::Pin(dest)) => RouteOutcome::Pin(*dest),
+            Some(CompiledRoute::Extract { extract, fallback }) => RouteOutcome::Identifier {
+                key: match extract
+                    .as_ref()
+                    .map(|extract| self.extract(extract, head, body))
+                {
+                    None | Some(Ok(None)) => Extracted::Missing,
+                    Some(Err(Ambiguous)) => Extracted::Invalid,
+                    Some(Ok(Some(raw))) => match RoutingKey::parse(&raw, rules) {
+                        Ok(Some(key)) => Extracted::Key(key),
+                        Ok(None) => Extracted::Missing,
+                        Err(_) => Extracted::Invalid,
+                    },
+                },
+                fallback: *fallback,
+            },
+            None => RouteOutcome::Identifier {
+                key: Extracted::Missing,
+                fallback: None,
+            },
         }
     }
 
-    fn extract_authorization(&self, head: &Head) -> Option<String> {
-        let value = head.header("authorization")?;
-        let value = value.trim();
-        if let Some(rest) = strip_scheme(value, "basic") {
-            let text = BASE64.decode_to_string(rest.trim()).ok()?;
-            let login = match text.split_once(':') {
-                Some((login, _)) => login,
-                None => text.as_str(),
-            };
-            return Some(login.trim().to_lowercase());
+    fn extract<'a>(
+        &self,
+        extract: &Extract,
+        head: &'a Head,
+        body: Option<&'a [u8]>,
+    ) -> Result<Option<Cow<'a, str>>, Ambiguous> {
+        Ok(match extract {
+            Extract::Authorization => self.extract_authorization(head),
+            Extract::Query { param } => match head.query() {
+                Some(query) => query_param(query, param)?,
+                None => None,
+            },
+            Extract::Body { regex } => body
+                .and_then(|body| std::str::from_utf8(body).ok())
+                .and_then(|text| regex.captures(text)?.get(1))
+                .map(|captured| form_decode(captured.as_str())),
+            Extract::Header { name, kind } => {
+                let mut values = head.values_named(*kind, name);
+                let first = values.next();
+                if values.next().is_some() {
+                    return Err(Ambiguous);
+                }
+                first
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .map(Cow::Borrowed)
+            }
+        })
+    }
+
+    fn extract_authorization<'a>(&self, head: &'a Head) -> Option<Cow<'a, str>> {
+        let value = head.header(HeaderKind::Authorization)?.trim_ascii();
+        if let Some(credentials) = strip_scheme(value, BASIC) {
+            let mut decoded = BASE64.decode(credentials.trim_ascii()).ok()?;
+            if let Some(colon) = memchr(b':', &decoded) {
+                decoded.truncate(colon);
+            }
+            let mut login = String::from_utf8(decoded).ok()?;
+            let leading = login.len() - login.trim_start().len();
+            login.truncate(login.trim_end().len());
+            login.drain(..leading);
+            return Some(Cow::Owned(login));
         }
-        if let Some(rest) = strip_scheme(value, "bearer") {
-            return bearer_identifier(rest.trim(), &self.jwt_username_claim);
-        }
-        None
+        let token = std::str::from_utf8(strip_scheme(value, BEARER)?.trim_ascii()).ok()?;
+        bearer_identifier(token, &self.jwt_username_claim).map(Cow::Owned)
     }
 }
 
-fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
-    if value.len() < scheme.len() + 1 {
-        return None;
+impl CompiledRoute {
+    fn build(
+        route: &HttpRoute,
+        dest_names: &AHashMap<Box<str>, DestId>,
+    ) -> Result<Self, ProxyError> {
+        let lookup = |name: &str| {
+            dest_names.get(name).copied().ok_or_else(|| {
+                ProxyError::config(format!(
+                    "http route {:?} references undeclared destination {name:?}",
+                    route.match_glob
+                ))
+            })
+        };
+        if let Some(destination) = &route.destination {
+            return lookup(destination).map(CompiledRoute::Pin);
+        }
+        Ok(CompiledRoute::Extract {
+            extract: route.extract.as_ref().map(Extract::build).transpose()?,
+            fallback: route.fallback.as_deref().map(lookup).transpose()?,
+        })
     }
-    let (head, rest) = value.split_at(scheme.len());
-    if head.eq_ignore_ascii_case(scheme) && rest.starts_with(' ') {
-        Some(&rest[1..])
+}
+
+impl Extract {
+    fn build(extract: &HttpExtract) -> Result<Self, ProxyError> {
+        let missing = |field: &str| {
+            ProxyError::config(format!(
+                "http extract from {:?} requires {field}",
+                extract.from
+            ))
+        };
+        Ok(match extract.from {
+            ExtractFrom::Authorization => Extract::Authorization,
+            ExtractFrom::Query => Extract::Query {
+                param: extract
+                    .param
+                    .as_deref()
+                    .ok_or_else(|| missing("param"))?
+                    .into(),
+            },
+            ExtractFrom::Body => Extract::Body {
+                regex: Regex::new(extract.regex.as_deref().ok_or_else(|| missing("regex"))?)
+                    .map_err(|e| ProxyError::config(format!("invalid http extract regex: {e}")))?,
+            },
+            ExtractFrom::Header => {
+                let name = extract
+                    .header
+                    .as_deref()
+                    .ok_or_else(|| missing("header"))?
+                    .as_bytes();
+                Extract::Header {
+                    name: name.into(),
+                    kind: HeaderKind::classify(name),
+                }
+            }
+        })
+    }
+}
+
+fn strip_scheme<'a>(value: &'a [u8], scheme: &[u8]) -> Option<&'a [u8]> {
+    let name = value.get(..scheme.len())?;
+    let rest = value.get(scheme.len()..)?;
+    if name.eq_ignore_ascii_case(scheme) {
+        rest.strip_prefix(b" ")
     } else {
         None
     }
 }
 
-fn compile_route(route: &HttpRoute) -> Result<CompiledRoute> {
-    let extract = match &route.extract {
-        Some(e) => Some(compile_extract(e)?),
-        None => None,
+fn is_dot_segment(segment: &[u8]) -> bool {
+    hashify::set_ignore_case!(segment, ".", "..", "%2e", ".%2e", "%2e.", "%2e%2e")
+}
+
+fn strip_authority(target: &str) -> &str {
+    if target.starts_with('/') {
+        return target;
+    }
+    let Some((scheme, rest)) = target.split_once("://") else {
+        return target;
     };
-    let needs_body = matches!(
-        &route.extract,
-        Some(HttpExtract {
-            from: ExtractFrom::Body,
-            ..
-        })
-    );
-    Ok(CompiledRoute {
-        destination: route.destination.clone(),
-        extract,
-        fallback: route.fallback.as_deref().map(Arc::from),
-        needs_body,
-    })
+    if !hashify::set_ignore_case!(scheme.as_bytes(), "http", "https") {
+        return target;
+    }
+    match memchr(b'/', rest.as_bytes()) {
+        Some(slash) => rest.get(slash..).unwrap_or("/"),
+        None => "/",
+    }
 }
 
-fn compile_extract(extract: &HttpExtract) -> Result<CompiledExtract> {
-    let regex = match &extract.regex {
-        Some(re) => Some(
-            Regex::new(re)
-                .map_err(|e| ProxyError::config(format!("invalid http extract regex: {e}")))?,
-        ),
-        None => None,
+fn normalize_path(target: &str) -> Result<Cow<'_, str>, MatchError> {
+    let path = strip_authority(target);
+    if memchr2(b'.', b'%', path.as_bytes()).is_some()
+        && path.as_bytes().split(|&b| b == b'/').any(is_dot_segment)
+    {
+        return Err(MatchError::DotSegment);
+    }
+    if !path.contains("//") {
+        return Ok(Cow::Borrowed(path));
+    }
+    let mut collapsed = String::with_capacity(path.len());
+    let mut segments = path.split('/');
+    collapsed.extend(segments.next());
+    for segment in segments.filter(|segment| !segment.is_empty()) {
+        collapsed.push('/');
+        collapsed.push_str(segment);
+    }
+    if path.ends_with('/') {
+        collapsed.push('/');
+    }
+    Ok(Cow::Owned(collapsed))
+}
+
+fn query_param<'a>(query: &'a str, param: &str) -> Result<Option<Cow<'a, str>>, Ambiguous> {
+    let mut values = query.split('&').filter_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (form_decode(key) == param).then_some(value)
+    });
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(Ambiguous);
+    }
+    Ok(first.map(form_decode))
+}
+
+fn form_decode(input: &str) -> Cow<'_, str> {
+    if memchr2(b'+', b'%', input.as_bytes()).is_none() {
+        return Cow::Borrowed(input);
+    }
+    let spaced: Cow<'_, str> = if memchr(b'+', input.as_bytes()).is_some() {
+        Cow::Owned(input.replace('+', " "))
+    } else {
+        Cow::Borrowed(input)
     };
-    Ok(CompiledExtract {
-        from: extract.from,
-        regex,
-        param: extract.param.clone(),
-        header: extract.header.clone(),
-    })
+    if memchr(b'%', spaced.as_bytes()).is_none() {
+        return spaced;
+    }
+    Cow::Owned(percent_decode_str(&spaced).decode_utf8_lossy().into_owned())
 }
 
-fn query_param(query: &str, param: &str) -> Option<String> {
-    for pair in query.split('&') {
-        let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (pair, ""),
-        };
-        if form_decode(key) == param {
-            return Some(form_decode(value));
-        }
-    }
-    None
-}
-
-fn form_decode(input: &str) -> String {
-    let replaced = input.replace('+', " ");
-    percent_encoding::percent_decode_str(&replaced)
-        .decode_utf8_lossy()
-        .into_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::HttpConfig;
-    use crate::http::head::{Head, ParseOutcome};
-
-    fn parse(buf: &[u8]) -> Head {
-        match Head::parse(buf, 64 * 1024).unwrap() {
-            ParseOutcome::Done { head, .. } => head,
-            _ => panic!("need more"),
-        }
-    }
-
-    fn route(router: &HttpRouter, head: &Head, body: Option<&[u8]>) -> RouteOutcome {
-        let idx = router.match_index(head).expect("route should match");
-        router.route_at(idx, head, body)
-    }
-
-    fn router_from_toml(toml: &str) -> HttpRouter {
-        let http: HttpConfig = toml::from_str(toml).unwrap();
-        HttpRouter::build(&http, "email".to_string()).unwrap()
-    }
-
-    #[test]
-    fn glob_first_match_wins() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/.well-known/**"
-destination = "legacy"
-[[route]]
-match = "/**"
-destination = "other"
-"#,
-        );
-        let head = parse(b"GET /.well-known/jmap HTTP/1.1\r\nHost: x\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Pin { dest_id } => assert_eq!(dest_id, "legacy"),
-            _ => panic!("expected pin"),
-        }
-        let head = parse(b"GET /other/path HTTP/1.1\r\nHost: x\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Pin { dest_id } => assert_eq!(dest_id, "other"),
-            _ => panic!("expected pin"),
-        }
-    }
-
-    #[test]
-    fn trailing_slash_matches_specific_route_over_catchall() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/api"
-destination = "legacy"
-[[route]]
-match = "/**"
-destination = "other"
-"#,
-        );
-        let head = parse(b"GET /api/ HTTP/1.1\r\nHost: x\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Pin { dest_id } => assert_eq!(dest_id, "legacy"),
-            _ => panic!("expected pin"),
-        }
-        assert_eq!(head.path(), "/api/");
-    }
-
-    #[test]
-    fn root_path_not_emptied_by_trim() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/"
-destination = "legacy"
-"#,
-        );
-        let head = parse(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Pin { dest_id } => assert_eq!(dest_id, "legacy"),
-            _ => panic!("expected pin"),
-        }
-    }
-
-    #[test]
-    fn static_pin_vs_identifier() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/static"
-destination = "legacy"
-[[route]]
-match = "/**"
-extract = { from = "authorization" }
-fallback = "legacy"
-"#,
-        );
-        let head = parse(b"GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(matches!(
-            route(&router, &head, None),
-            RouteOutcome::Pin { .. }
-        ));
-        let head = parse(b"GET /dyn HTTP/1.1\r\nHost: x\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Identifier { fallback, .. } => {
-                assert_eq!(fallback.as_deref(), Some("legacy"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
-    fn basic_auth_lowercased() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/**"
-extract = { from = "authorization" }
-"#,
-        );
-        let creds = BASE64.encode("Alice@Example.COM:secret");
-        let req = format!("GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {creds}\r\n\r\n");
-        let head = parse(req.as_bytes());
-        match route(&router, &head, None) {
-            RouteOutcome::Identifier { identifier, .. } => {
-                assert_eq!(identifier.as_deref(), Some("alice@example.com"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
-    fn bearer_uses_bearer_identifier() {
-        use encodify::base64::URL_SAFE_NO_PAD;
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/**"
-extract = { from = "authorization" }
-"#,
-        );
-        let claims = URL_SAFE_NO_PAD.encode(r#"{"email":"bob@example.com"}"#);
-        let token = format!("hdr.{claims}.sig");
-        let req = format!("GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n");
-        let head = parse(req.as_bytes());
-        match route(&router, &head, None) {
-            RouteOutcome::Identifier { identifier, .. } => {
-                assert_eq!(identifier.as_deref(), Some("bob@example.com"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
-    fn query_param_url_decoded() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/oauth/**"
-extract = { from = "query", param = "login_hint" }
-"#,
-        );
-        let head = parse(
-            b"GET /oauth/authorize?login_hint=user%40example.com&x=1 HTTP/1.1\r\nHost: x\r\n\r\n",
-        );
-        match route(&router, &head, None) {
-            RouteOutcome::Identifier { identifier, .. } => {
-                assert_eq!(identifier.as_deref(), Some("user@example.com"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
-    fn body_regex_capture() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/auth/token"
-extract = { from = "body", regex = "username=([^&]+)" }
-"#,
-        );
-        let head = parse(b"POST /auth/token HTTP/1.1\r\nHost: x\r\nContent-Length: 30\r\n\r\n");
-        assert!(router.needs_body_at(router.match_index(&head).unwrap()));
-        let body = b"grant=x&username=joe%40corp.com";
-        match route(&router, &head, Some(body)) {
-            RouteOutcome::Identifier { identifier, .. } => {
-                assert_eq!(identifier.as_deref(), Some("joe@corp.com"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
-    fn header_extraction() {
-        let router = router_from_toml(
-            r#"
-[[route]]
-match = "/**"
-extract = { from = "header", header = "X-User" }
-"#,
-        );
-        let head = parse(b"GET / HTTP/1.1\r\nHost: x\r\nX-User: someone\r\n\r\n");
-        match route(&router, &head, None) {
-            RouteOutcome::Identifier { identifier, .. } => {
-                assert_eq!(identifier.as_deref(), Some("someone"));
-            }
-            _ => panic!("expected identifier"),
-        }
-    }
-}
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../../proxy-tests/unit/src/http/router/tests.rs"]
+mod tests;

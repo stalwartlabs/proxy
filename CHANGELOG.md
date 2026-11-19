@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [2.0.0] - 2026-11-21
+
+### Added
+- WebUI for management.
+
+### Changed
+- Code refactoring.
+
+### Fixed
+
 ## [1.0.5] - 2026-10-25
 
 ### Added

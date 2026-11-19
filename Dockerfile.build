@@ -132,14 +132,16 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     chown stalwart-proxy:stalwart-proxy /etc/proxy
 COPY --from=builder --chmod=0755 /app/artifact/proxy /usr/local/bin/proxy
 RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/proxy
+COPY --chmod=0755 resources/docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 USER stalwart-proxy
 WORKDIR /etc/proxy
 VOLUME ["/etc/proxy"]
 EXPOSE	24 25 110 143 465 587 993 995 4190 443 9443
-ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz
+ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz \
+    PROXY_ADMIN_BIND=0.0.0.0:9443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsSk "$PROXY_HEALTHCHECK_URL" || exit 1
-ENTRYPOINT ["/usr/local/bin/proxy"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/etc/proxy/config.toml"]
 
 # *****************
@@ -154,12 +156,14 @@ RUN apk add --update --no-cache ca-certificates curl tzdata libcap && \
     chown stalwart-proxy:stalwart-proxy /etc/proxy
 COPY --from=builder --chmod=0755 /app/artifact/proxy /usr/local/bin/proxy
 RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/proxy
+COPY --chmod=0755 resources/docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 USER stalwart-proxy
 WORKDIR /etc/proxy
 VOLUME ["/etc/proxy"]
 EXPOSE	24 25 110 143 465 587 993 995 4190 443 9443
-ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz
+ENV PROXY_HEALTHCHECK_URL=https://127.0.0.1:9443/healthz \
+    PROXY_ADMIN_BIND=0.0.0.0:9443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsSk "$PROXY_HEALTHCHECK_URL" || exit 1
-ENTRYPOINT ["/usr/local/bin/proxy"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/etc/proxy/config.toml"]

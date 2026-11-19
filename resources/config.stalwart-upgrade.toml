@@ -1,5 +1,5 @@
 # ===========================================================================
-# Migration proxy: Stalwart upgrade (old -> new) sample configuration.
+# Stalwart Proxy: Stalwart upgrade (old -> new) sample configuration.
 #
 # This configuration fronts two Stalwart deployments at the same time: an older
 # one ("old", typically v0.15 or below) that still holds most accounts, and a
@@ -25,8 +25,8 @@ log_level = "info"
 # TLS certificate the proxy presents to clients. This is the certificate for
 # the public hostname above; it terminates implicit TLS and STARTTLS.
 [tls.certificate.default]
-cert = "/etc/proxy/tls/fullchain.pem"  # CHANGE ME
-key = "/etc/proxy/tls/privkey.pem"     # CHANGE ME
+cert = "/etc/proxy/certs/fullchain.pem"  # CHANGE ME
+key = "/etc/proxy/certs/privkey.pem"     # CHANGE ME
 default = true
 
 [tls.protocols]
@@ -66,7 +66,7 @@ negative_ttl = "30s"
 # List both the e-mail address and the bare account name when the old server
 # allowed logging in with either form. New entries take effect after a mapping
 # reload (see the management API) or a cache expiry.
-path = "/etc/proxy/mappings.tsv"       # CHANGE ME
+path = "/etc/proxy/mappings/mappings.tsv"  # CHANGE ME
 
 # ---------------------------------------------------------------------------
 # Destinations.
@@ -265,7 +265,7 @@ tls = "plain"
 [admin]
 bind = "127.0.0.1:9443"
 tls = "implicit"
-bearer_token_file = "/etc/proxy/admin.token"  # CHANGE ME
+bearer_token_file = "/etc/proxy/admin-token"  # CHANGE ME
 min_token_len = 32
 lockout_threshold = 5
 lockout_duration = "5m"

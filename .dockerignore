@@ -5,3 +5,6 @@
 !src
 !Cargo.toml
 !Cargo.lock
+!build.rs
+!ui
+!resources/docker

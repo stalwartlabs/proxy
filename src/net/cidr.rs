@@ -4,10 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+const V4_MAPPED_PREFIX: u32 = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
@@ -25,20 +28,11 @@ fn to_u128(ip: IpAddr) -> (u128, bool) {
 
 impl Cidr {
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let (mut addr, is_v6) = to_u128(ip);
-        if self.is_v6 != is_v6 {
-            if !self.is_v6 && is_v6 {
-                if let IpAddr::V6(v6) = ip {
-                    if let Some(v4) = v6.to_ipv4_mapped() {
-                        addr = u128::from(v4.to_ipv6_mapped());
-                    } else {
-                        return false;
-                    }
-                }
-            } else {
-                return false;
-            }
-        }
+        let addr = match ip {
+            IpAddr::V4(_) if self.is_v6 => return false,
+            IpAddr::V4(v4) => u128::from(v4.to_ipv6_mapped()),
+            IpAddr::V6(v6) => u128::from(v6),
+        };
         (addr & self.mask) == self.network
     }
 }
@@ -67,18 +61,7 @@ impl FromStr for Cidr {
         if prefix > max_prefix {
             return Err(format!("prefix /{prefix} too large for address in {s:?}"));
         }
-        let total_bits = if is_v6 { 128 } else { 32 };
-        let host_bits = total_bits - prefix;
-        let mask = if host_bits == 0 {
-            u128::MAX
-        } else {
-            (!0u128).checked_shl(host_bits).unwrap_or(0)
-        };
-        let mask = if is_v6 {
-            mask
-        } else {
-            mask | u128::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0))
-        };
+        let mask = u128::MAX.checked_shl(max_prefix - prefix).unwrap_or(0);
         Ok(Cidr {
             network: network_raw & mask,
             mask,
@@ -97,35 +80,30 @@ impl<'de> Deserialize<'de> for Cidr {
     }
 }
 
-pub fn any_contains(nets: &[Cidr], ip: IpAddr) -> bool {
-    nets.iter().any(|n| n.contains(ip))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matches_v4() {
-        let c: Cidr = "10.0.0.0/8".parse().unwrap();
-        assert!(c.contains("10.1.2.3".parse().unwrap()));
-        assert!(c.contains("10.255.255.255".parse().unwrap()));
-        assert!(!c.contains("11.0.0.1".parse().unwrap()));
-        let c: Cidr = "192.168.1.1".parse().unwrap();
-        assert!(c.contains("192.168.1.1".parse().unwrap()));
-        assert!(!c.contains("192.168.1.2".parse().unwrap()));
-    }
-
-    #[test]
-    fn matches_v6() {
-        let c: Cidr = "2001:db8::/32".parse().unwrap();
-        assert!(c.contains("2001:db8::1".parse().unwrap()));
-        assert!(!c.contains("2001:db9::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn mapped_v4_in_v4_net() {
-        let c: Cidr = "10.0.0.0/8".parse().unwrap();
-        assert!(c.contains("::ffff:10.0.0.5".parse().unwrap()));
+impl fmt::Display for Cidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let network = Ipv6Addr::from(self.network);
+        let ones = self.mask.leading_ones();
+        match network.to_ipv4_mapped() {
+            Some(v4) if !self.is_v6 => write!(f, "{v4}/{}", ones.saturating_sub(V4_MAPPED_PREFIX)),
+            _ => write!(f, "{network}/{ones}"),
+        }
     }
 }
+
+impl Serialize for Cidr {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl Cidr {
+    pub fn any_contains(nets: &[Cidr], ip: IpAddr) -> bool {
+        nets.iter().any(|n| n.contains(ip))
+    }
+}
+
+#[cfg(all(test, proxy_tests))]
+#[rustfmt::skip]
+#[path = "../../../proxy-tests/unit/src/net/cidr/tests.rs"]
+mod tests;

@@ -1,4 +1,4 @@
-# Migration proxy sample configuration.
+# Stalwart Proxy sample configuration.
 #
 # This is a starting template. Edit the destinations, mappings, TLS
 # certificates and admin token to match your deployment, then start the
@@ -19,8 +19,8 @@ log_level = "info"
 # TLS certificates used to TERMINATE inbound implicit-TLS and STARTTLS.
 # Multiple certificates are selected by SNI. Mark one as the default.
 [tls.certificate.default]
-cert = "/etc/proxy/tls/fullchain.pem"
-key = "/etc/proxy/tls/privkey.pem"
+cert = "/etc/proxy/certs/fullchain.pem"
+key = "/etc/proxy/certs/privkey.pem"
 default = true
 
 [tls.protocols]
@@ -44,7 +44,7 @@ negative_ttl = "30s"
 positive_ttl = "10m"
 
 [mapping.file]
-path = "/etc/proxy/mappings.tsv"
+path = "/etc/proxy/mappings/mappings.tsv"
 
 # [mapping.redis]
 # url = "redis://10.0.0.5:6379"
@@ -84,6 +84,10 @@ tls = "implicit"
 host = "10.0.1.20"
 tls_server_name = "mail.new.example.com"
 proxy_protocol = true
+# With a host name instead of an IP address, the name is resolved at each
+# connection. dns_cache_ttl reuses the resolved addresses for this long; it
+# overrides the TTL of the DNS records.
+# dns_cache_ttl = "60s"
 
 [destination.stalwart.protocol.imap]
 port = 993
@@ -168,7 +172,14 @@ fallback = "legacy"
 [admin]
 bind = "127.0.0.1:9443"
 tls = "implicit"
-bearer_token_file = "/etc/proxy/admin.token"
+bearer_token_file = "/etc/proxy/admin-token"
 min_token_len = 32
 lockout_threshold = 5
 lockout_duration = "5m"
+
+# Optional limits on the listeners and destinations that can be added through
+# the management API (`proxy init` writes one). An empty list allows anything.
+# [admin.allow]
+# listener_ports = [143, 993, 995, 465, 587, 4190, "1024-9442", "9444-65535"]
+# destination_hosts = ["10.0.0.0/8", "backend.internal", "*.backend.internal"]
+# destination_ports = [143, 993, 995, 465, 587, 4190, 443]

@@ -7,7 +7,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
 #
 
-# Migration proxy install script -- based on the rustup installation script.
+# Stalwart Proxy install script -- based on the rustup installation script.
 
 set -e
 set -u
@@ -24,6 +24,7 @@ main() {
     need_cmd rm
     need_cmd tar
     need_cmd cp
+    need_cmd mv
     need_cmd tr
     need_cmd hostname
 
@@ -65,23 +66,22 @@ main() {
     done
 
     # Derive install paths: FHS by default, self-contained under a custom prefix
-    local _bin_dir _bin_file _conf_dir _tls_dir _log_dir
-    local _config_file _mappings_file _token_file _env_file
+    local _bin_dir _bin_file _conf_dir _log_dir
+    local _config_file _token_file _env_file
     if [ -z "$_prefix" ]; then
         _bin_dir="/usr/local/bin"
         _conf_dir="/etc/proxy"
         _log_dir="/var/log/proxy"
+        _env_file="/etc/proxy.env"
     else
         _bin_dir="${_prefix}/bin"
         _conf_dir="${_prefix}/etc"
         _log_dir="${_prefix}/logs"
+        _env_file="${_prefix}/proxy.env"
     fi
-    _tls_dir="${_conf_dir}/tls"
     _bin_file="${_bin_dir}/proxy"
     _config_file="${_conf_dir}/config.toml"
-    _mappings_file="${_conf_dir}/mappings.tsv"
-    _token_file="${_conf_dir}/admin.token"
-    _env_file="${_conf_dir}/proxy.env"
+    _token_file="${_conf_dir}/admin-token"
 
     # Detect architecture
     get_architecture || return 1
@@ -91,48 +91,62 @@ main() {
     # Create service account
     create_account "$_os" "$_account"
 
-    # Create directories
-    ensure mkdir -p "$_bin_dir" "$_conf_dir" "$_tls_dir" "$_log_dir"
+    # Create directories, remembering which ones this run created
+    local _new_log=""
+    [ -d "$_log_dir" ] || _new_log="yes"
+    ensure mkdir -p "$_bin_dir" "$_conf_dir" "$_log_dir"
 
     # Download and install the binary
-    say "Downloading proxy for ${_arch}..."
+    say "Installing proxy for ${_arch}..."
     local _tmp _tar
     _tmp="$(mktemp -d)"
     _tar="${_tmp}/proxy.tar.gz"
-    ensure downloader "${BASE_URL}/proxy-${_arch}.tar.gz" "$_tar" "$_arch"
+    if [ -n "${PROXY_ARCHIVE:-}" ]; then
+        ensure cp "$PROXY_ARCHIVE" "$_tar"
+    else
+        ensure downloader "${BASE_URL}/proxy-${_arch}.tar.gz" "$_tar" "$_arch"
+    fi
     ensure tar zxf "$_tar" -C "$_tmp"
-    ensure cp "${_tmp}/proxy" "$_bin_file"
-    ensure chmod 0755 "$_bin_file"
+    ensure cp "${_tmp}/proxy" "${_bin_file}.new"
+    ensure chmod 0755 "${_bin_file}.new"
+    ensure mv -f "${_bin_file}.new" "$_bin_file"
     ensure rm -rf "$_tmp"
 
-    # Provision config, mappings, env file and admin token (preserve existing files)
-    if [ ! -e "$_config_file" ]; then
-        say "Writing sample config at ${_config_file}..."
-        write_config_file "$_config_file"
+    # Ownership: the service rewrites its config from the management UI, so
+    # it owns the config directory. Only that directory (on a fresh install)
+    # and directories this run created change owner, by name and without
+    # following links; nothing is chowned recursively. The env file stays
+    # root-owned outside the config directory.
+    say "Setting permissions..."
+    if [ -n "$_new_log" ]; then
+        ensure chown -h "${_account}:${_account}" "$_log_dir"
+        ensure chmod 0750 "$_log_dir"
     fi
-    if [ ! -e "$_mappings_file" ]; then
-        say "Writing sample mappings at ${_mappings_file}..."
-        write_mappings_file "$_mappings_file"
+
+    # Provision a minimal config, admin token and certificate on a fresh
+    # install, written by the service account itself; an existing config is
+    # never touched
+    local _fresh=""
+    local _init_out=""
+    if [ ! -e "$_config_file" ]; then
+        ensure chown -h "${_account}:${_account}" "$_conf_dir"
+        ensure chmod 0750 "$_conf_dir"
+        say "Writing initial config at ${_config_file}..."
+        _init_out="$(cd / && run_as "$_account" "$_bin_file" init "$_conf_dir")" \
+            || err "Install failed: proxy init did not complete."
+        _fresh="yes"
     fi
     if [ ! -e "$_env_file" ]; then
         say "Writing env file at ${_env_file}..."
         write_env_file "$_env_file"
     fi
-    if [ ! -e "$_token_file" ]; then
-        say "Generating admin token at ${_token_file}..."
-        write_token_file "$_token_file"
+    ensure chown -h "root:${_account}" "$_env_file"
+    ensure chmod 0640 "$_env_file"
+    if [ -e "${_conf_dir}/proxy.env" ]; then
+        say "Note: ${_conf_dir}/proxy.env is no longer read. Review it and move any"
+        say "settings you still need into ${_env_file}, then delete it."
     fi
 
-    # Ownership and permissions
-    say "Setting permissions..."
-    ensure chown -R "${_account}:${_account}" "$_conf_dir" "$_log_dir"
-    ensure chmod 0750 "$_conf_dir" "$_tls_dir" "$_log_dir"
-    ensure chmod 0640 "$_config_file" "$_mappings_file"
-    ensure chown "root:${_account}" "$_env_file" "$_token_file"
-    ensure chmod 0640 "$_env_file" "$_token_file"
-
-    # Install the service (enabled, but not started: the proxy will not run
-    # until the sample config has been edited for the local deployment)
     say "Installing service..."
     local _service_type=""
     local _start_cmd=""
@@ -155,19 +169,33 @@ main() {
             ;;
     esac
 
-    # Completion message
     say ""
     say "Installation complete."
     say ""
-    say "Before the proxy can start you must:"
-    say "  1. Edit ${_config_file} (destinations, listeners, routing)."
-    say "  2. Install the inbound TLS certificate and key under ${_tls_dir}/."
-    say "  3. Populate ${_mappings_file} with '<identifier>\\t<destination-id>' lines."
-    say ""
-    say "An admin bearer token was generated at ${_token_file}."
-    say ""
-    say "Once configured, start the service with:"
-    say "     ${_start_cmd}"
+    if [ -n "$_fresh" ]; then
+        say "Starting the service..."
+        if start_service "$_service_type"; then
+            say "The proxy is running with a minimal configuration."
+        else
+            say "The service did not start; start it with: ${_start_cmd}"
+        fi
+        say ""
+        printf '%s\n' "$_init_out" | while IFS= read -r _line; do say "  ${_line}"; done
+        say ""
+        say "Open the admin UI and sign in with the token stored in ${_token_file}"
+        say "(sudo cat ${_token_file}). The UI is bound to the loopback interface;"
+        say "from another machine use an SSH tunnel: ssh -L 9443:127.0.0.1:9443 <host>."
+        say "Configure destinations, routing, mappings and listeners from the UI."
+    else
+        say "The existing configuration at ${_config_file} was kept."
+        local _restarted=0
+        restart_service "$_service_type" || _restarted=$?
+        case "$_restarted" in
+            0) say "The running service was restarted on the new binary." ;;
+            2) say "The service is not running; start it with: ${_start_cmd}" ;;
+            *) say "The service could not be restarted; restart it to run the new binary." ;;
+        esac
+    fi
     say ""
 
     return 0
@@ -177,170 +205,36 @@ print_usage() {
     cat <<'EOF'
 Usage: install.sh [PREFIX]
 
-Install the migration proxy into standard FHS paths or under a custom prefix.
+Install Stalwart Proxy into standard FHS paths or under a custom prefix.
 
 Options:
   -h, --help  Show this help.
 
+Environment:
+  PROXY_ARCHIVE  Install from this local proxy-<arch>.tar.gz instead of
+                 downloading the latest release.
+
 With no PREFIX, the proxy is installed under standard FHS paths:
   binary   /usr/local/bin/proxy
   config   /etc/proxy/config.toml
-  mappings /etc/proxy/mappings.tsv
-  tls      /etc/proxy/tls/
-  token    /etc/proxy/admin.token
-  env      /etc/proxy/proxy.env
+  certs    /etc/proxy/certs/
+  token    /etc/proxy/admin-token
+  env      /etc/proxy.env
   logs     /var/log/proxy/
 
 When PREFIX is provided, a self-contained layout is used instead:
   binary   $PREFIX/bin/proxy
   config   $PREFIX/etc/config.toml
-  mappings $PREFIX/etc/mappings.tsv
-  tls      $PREFIX/etc/tls/
-  token    $PREFIX/etc/admin.token
-  env      $PREFIX/etc/proxy.env
+  certs    $PREFIX/etc/certs/
+  token    $PREFIX/etc/admin-token
+  env      $PREFIX/proxy.env
   logs     $PREFIX/logs/
-EOF
-}
-
-write_config_file() {
-    cat > "$1" <<'EOF'
-# Migration proxy configuration. Edit this template for your deployment.
-# The proxy refuses to boot until every referenced destination, certificate
-# and credential path is valid (see SPEC section 8.4).
-
-[server]
-threads = 0
-hostname = "proxy.example.com"
-shutdown_grace = "30s"
-log_level = "info"
-
-[tls.certificate.default]
-cert = "/etc/proxy/tls/fullchain.pem"
-key = "/etc/proxy/tls/privkey.pem"
-default = true
-
-[tls.protocols]
-min_version = "1.2"
-
-[routing]
-default_destination = "legacy"
-# smtp_passthrough_destination = "stalwart"
-
-[mapping]
-source = "file"
-normalize = "lowercase"
-negative_ttl = "30s"
-positive_ttl = "10m"
-
-[mapping.file]
-path = "/etc/proxy/mappings.tsv"
-
-[destination.legacy]
-host = "10.0.1.10"
-tls_server_name = "mail.legacy.example.com"
-proxy_protocol = true
-[destination.legacy.protocol.imap]
-port = 993
-tls = "implicit"
-[destination.legacy.protocol.pop3]
-port = 995
-tls = "implicit"
-[destination.legacy.protocol.submission]
-port = 587
-tls = "starttls"
-[destination.legacy.protocol.managesieve]
-port = 4190
-tls = "starttls"
-[destination.legacy.protocol.http]
-port = 443
-tls = "implicit"
-
-[destination.stalwart]
-host = "10.0.1.20"
-tls_server_name = "mail.new.example.com"
-proxy_protocol = true
-[destination.stalwart.protocol.imap]
-port = 993
-tls = "implicit"
-[destination.stalwart.protocol.pop3]
-port = 995
-tls = "implicit"
-[destination.stalwart.protocol.submission]
-port = 465
-tls = "implicit"
-[destination.stalwart.protocol.managesieve]
-port = 4190
-tls = "starttls"
-[destination.stalwart.protocol.http]
-port = 443
-tls = "implicit"
-
-[listener.imap]
-protocol = "imap"
-bind = ["[::]:993"]
-tls = "implicit"
-
-[listener.imap-starttls]
-protocol = "imap"
-bind = ["[::]:143"]
-tls = "starttls"
-
-[listener.pop3]
-protocol = "pop3"
-bind = ["[::]:995"]
-tls = "implicit"
-
-[listener.submission]
-protocol = "submission"
-bind = ["[::]:587"]
-tls = "starttls"
-
-[listener.submissions]
-protocol = "submission"
-bind = ["[::]:465"]
-tls = "implicit"
-
-[listener.managesieve]
-protocol = "managesieve"
-bind = ["[::]:4190"]
-tls = "starttls"
-
-[listener.https]
-protocol = "http"
-bind = ["[::]:443"]
-tls = "implicit"
-forwarded = "off"
-
-[[http.route]]
-match = "/.well-known/**"
-destination = "legacy"
-
-[[http.route]]
-match = "/**"
-extract = { from = "authorization" }
-fallback = "legacy"
-
-[admin]
-bind = "127.0.0.1:9443"
-tls = "implicit"
-bearer_token_file = "/etc/proxy/admin.token"
-min_token_len = 32
-lockout_threshold = 5
-lockout_duration = "5m"
-EOF
-}
-
-write_mappings_file() {
-    cat > "$1" <<'EOF'
-# identifier<TAB>destination-id, one per line.
-# alice@legacy.example.com	legacy
-# carol@new.example.com	stalwart
 EOF
 }
 
 write_env_file() {
     cat > "$1" <<'EOF'
-# Environment variables for the migration proxy service.
+# Environment variables for the Stalwart Proxy service.
 # Uncomment and edit an entry to override its default.
 
 # Admin bearer token. Overrides [admin].bearer_token_file when set.
@@ -351,11 +245,45 @@ write_env_file() {
 EOF
 }
 
-write_token_file() {
-    local _token
-    _token="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48)"
-    assert_nz "$_token" "admin token"
-    printf '%s\n' "$_token" > "$1"
+run_as() {
+    local _user="$1"
+    shift
+    if check_cmd runuser; then
+        runuser -u "$_user" -- "$@"
+    elif check_cmd sudo; then
+        sudo -u "$_user" -- "$@"
+    else
+        err "Install failed: runuser or sudo is needed to run proxy init as ${_user}."
+    fi
+}
+
+start_service() {
+    case "$1" in
+        systemd) systemctl start proxy ;;
+        initd)   service proxy start ;;
+        launchd) launchctl bootstrap system /Library/LaunchDaemons/proxy.plist ;;
+        *)       return 1 ;;
+    esac
+}
+
+restart_service() {
+    case "$1" in
+        systemd)
+            systemctl is-active --quiet proxy || return 2
+            systemctl restart proxy
+            ;;
+        initd)
+            service proxy status > /dev/null 2>&1 || return 2
+            service proxy restart
+            ;;
+        launchd)
+            launchctl print system/proxy > /dev/null 2>&1 || return 2
+            launchctl bootout system/proxy && launchctl bootstrap system /Library/LaunchDaemons/proxy.plist
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 create_account() {
@@ -375,14 +303,14 @@ create_account() {
         ensure dscl /Local/Default -create Groups/_stalwart-proxy
         ensure dscl /Local/Default -create Groups/_stalwart-proxy Password \*
         ensure dscl /Local/Default -create Groups/_stalwart-proxy PrimaryGroupID $_gid
-        ensure dscl /Local/Default -create Groups/_stalwart-proxy RealName "Migration proxy service"
+        ensure dscl /Local/Default -create Groups/_stalwart-proxy RealName "Stalwart Proxy service"
         ensure dscl /Local/Default -create Groups/_stalwart-proxy RecordName _stalwart-proxy stalwart-proxy
 
         ensure dscl /Local/Default -create Users/_stalwart-proxy
         ensure dscl /Local/Default -create Users/_stalwart-proxy NFSHomeDirectory /var/empty
         ensure dscl /Local/Default -create Users/_stalwart-proxy Password \*
         ensure dscl /Local/Default -create Users/_stalwart-proxy PrimaryGroupID $_gid
-        ensure dscl /Local/Default -create Users/_stalwart-proxy RealName "Migration proxy service"
+        ensure dscl /Local/Default -create Users/_stalwart-proxy RealName "Stalwart Proxy service"
         ensure dscl /Local/Default -create Users/_stalwart-proxy RecordName _stalwart-proxy stalwart-proxy
         ensure dscl /Local/Default -create Users/_stalwart-proxy UniqueID $_uid
         ensure dscl /Local/Default -create Users/_stalwart-proxy UserShell /usr/bin/false
@@ -398,7 +326,7 @@ create_service_linux_systemd() {
     local _bin="$1" _config="$2" _env="$3" _user="$4"
     cat > /etc/systemd/system/proxy.service <<EOF
 [Unit]
-Description=Migration proxy
+Description=Stalwart Proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -433,8 +361,8 @@ create_service_linux_initd() {
 # Required-Stop:     \$network
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: Migration proxy
-# Description:       Starts and stops the migration proxy
+# Short-Description: Stalwart Proxy
+# Description:       Starts and stops Stalwart Proxy
 ### END INIT INFO
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
@@ -451,9 +379,22 @@ ULIMIT_NOFILE=65536
 [ -x "\$DAEMON" ] || exit 0
 
 if [ -r "\$ENV_FILE" ]; then
-    set -a
-    . "\$ENV_FILE"
-    set +a
+    while IFS= read -r line || [ -n "\$line" ]; do
+        case "\$line" in
+            ''|'#'*) continue ;;
+        esac
+        key="\${line%%=*}"
+        [ "\$key" != "\$line" ] || continue
+        case "\$key" in
+            ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        value="\${line#*=}"
+        case "\$value" in
+            \"*\") value="\${value#\"}"; value="\${value%\"}" ;;
+            \'*\') value="\${value#\'}"; value="\${value%\'}" ;;
+        esac
+        export "\$key=\$value"
+    done < "\$ENV_FILE"
 fi
 
 ulimit -n \$ULIMIT_NOFILE
@@ -481,7 +422,7 @@ do_stop()
 
 case "\$1" in
   start)
-    [ "\$VERBOSE" != no ] && log_daemon_msg "Starting migration proxy" "proxy"
+    [ "\$VERBOSE" != no ] && log_daemon_msg "Starting Stalwart Proxy" "proxy"
     do_start
     case "\$?" in
         0|1) [ "\$VERBOSE" != no ] && log_end_msg 0 ;;
@@ -489,7 +430,7 @@ case "\$1" in
     esac
     ;;
   stop)
-    [ "\$VERBOSE" != no ] && log_daemon_msg "Stopping migration proxy" "proxy"
+    [ "\$VERBOSE" != no ] && log_daemon_msg "Stopping Stalwart Proxy" "proxy"
     do_stop
     case "\$?" in
         0|1) [ "\$VERBOSE" != no ] && log_end_msg 0 ;;
@@ -497,10 +438,10 @@ case "\$1" in
     esac
     ;;
   status)
-    status_of_proc "\$DAEMON" "proxy" && exit 0 || exit \$?
+    status_of_proc -p "\$PIDFILE" "\$DAEMON" "proxy" && exit 0 || exit \$?
     ;;
   restart)
-    log_daemon_msg "Restarting migration proxy" "proxy"
+    log_daemon_msg "Restarting Stalwart Proxy" "proxy"
     do_stop
     case "\$?" in
       0|1)
@@ -541,7 +482,7 @@ create_service_macos() {
         <key>Label</key>
         <string>proxy</string>
         <key>ServiceDescription</key>
-        <string>Migration proxy</string>
+        <string>Stalwart Proxy</string>
         <key>UserName</key>
         <string>${_user}</string>
         <key>GroupName</key>
