@@ -7,7 +7,6 @@
 FROM --platform=$BUILDPLATFORM rust:slim-trixie AS base
 
 ENV DEBIAN_FRONTEND="noninteractive" \
-    BINSTALL_DISABLE_TELEMETRY=true \
     CARGO_TERM_COLOR=always \
     CARGO_NET_RETRY=10 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -31,27 +30,38 @@ RUN \
         aarch64) ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 ;; \
         *) exit 1 ;; \
     esac && \
-    curl --retry 5 -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+    curl --retry 5 --retry-all-errors -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
     echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     tar -J -x -C /usr/local -f /tmp/zig.tar.xz && \
     rm /tmp/zig.tar.xz && \
     ln -s "/usr/local/zig-$(uname -m)-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
     zig version
-# Install cargo-binstall
-RUN curl --retry 5 -fL --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-# Install cargo-chef & sccache. Versions are pinned so that an
-# upstream release without prebuilt binaries for this platform cannot silently
-# turn this into a from-source build, and the `compile` strategy is disabled
-# because that fallback needs an OpenSSL toolchain this image does not carry:
-# it burns minutes and then fails. A transient GitHub fetch failure is retried.
+# Install cargo-chef & sccache from pinned, checksummed release assets. Direct
+# release downloads are not subject to the GitHub API rate limit that made
+# cargo-binstall fail on shared runners.
 RUN \
-    for attempt in 1 2 3; do \
-        cargo binstall --no-confirm --disable-strategies compile \
-            cargo-chef@0.1.78 sccache@0.17.0 && break; \
-        echo "cargo binstall attempt ${attempt} failed, retrying"; \
-        sleep $((attempt * 15)); \
-    done && \
-    command -v cargo-chef && command -v sccache
+    CHEF_VERSION=0.1.78 && \
+    SCCACHE_VERSION=0.17.0 && \
+    case "$(uname -m)" in \
+        x86_64) \
+            CHEF_SHA256=aca691abfbfbbe00d482e0ed2249eec3091b65e96a0ce92947fb5b254d48b16d && \
+            SCCACHE_SHA256=67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006 ;; \
+        aarch64) \
+            CHEF_SHA256=cd59b90fce5fa84c4189648fec33404ec5491791eebdb812df5e7fca8336408d && \
+            SCCACHE_SHA256=821a86343191aa1cbab74bd42f9e93c9a63bf85e4742945f40d3ae84193c1c77 ;; \
+        *) exit 1 ;; \
+    esac && \
+    CHEF_DIR="cargo-chef-$(uname -m)-unknown-linux-musl" && \
+    SCCACHE_DIR="sccache-v${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl" && \
+    curl --retry 5 --retry-all-errors -fsSLo /tmp/cargo-chef.tar.xz "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CHEF_VERSION}/${CHEF_DIR}.tar.xz" && \
+    curl --retry 5 --retry-all-errors -fsSLo /tmp/sccache.tar.gz "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${SCCACHE_DIR}.tar.gz" && \
+    echo "${CHEF_SHA256}  /tmp/cargo-chef.tar.xz" | sha256sum -c - && \
+    echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c - && \
+    tar -J -x -C /usr/local/cargo/bin --strip-components=1 -f /tmp/cargo-chef.tar.xz "${CHEF_DIR}/cargo-chef" && \
+    tar -z -x -C /usr/local/cargo/bin --strip-components=1 -f /tmp/sccache.tar.gz "${SCCACHE_DIR}/sccache" && \
+    rm /tmp/cargo-chef.tar.xz /tmp/sccache.tar.gz && \
+    cargo chef --version && \
+    sccache --version
 RUN cargo install --locked --git https://github.com/rust-cross/cargo-zigbuild --rev d9f7fd32fbac13cc26d23847835f7f23a5ed3a25 cargo-zigbuild
 
 # *****************

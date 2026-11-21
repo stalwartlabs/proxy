@@ -25,5 +25,5 @@ jobs:
         run: |
           set -eu
           echo "Run $RUN_ID failed on attempt $RUN_ATTEMPT, re-running failed jobs"
-          sleep 60
+          sleep $((RUN_ATTEMPT * 300))
           gh run rerun "$RUN_ID" --failed

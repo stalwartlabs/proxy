@@ -41,7 +41,7 @@ jobs:
       contents: read
       attestations: write
       packages: write
-    needs: [linux]
+    needs: [linux, windows, macos]
     if: github.event_name == 'push' || inputs.Docker
     steps:
       - name: Install Cosign
@@ -493,14 +493,19 @@ jobs:
         run: gh release edit "${{ github.ref_name }}" --draft=false --latest --repo "${{ github.repository }}"
 
   cleanup:
-    name: Cleanup failed release
+    name: Report failed release
     needs: [linux, windows, macos, multiarch, release]
     if: failure() && startsWith(github.ref, 'refs/tags/') && github.run_attempt >= 3
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    permissions: {}
     steps:
-      - name: Delete draft release and tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag --repo "${{ github.repository }}" || true
+      - name: Keep draft release and tag for a manual re-run
+        run: |
+          {
+            echo "### Release ${{ github.ref_name }} not published"
+            echo ""
+            echo "Attempt ${{ github.run_attempt }} failed. The draft release and the tag are kept."
+            echo "If the cause was transient, resume with \`gh run rerun ${{ github.run_id }} --failed --repo ${{ github.repository }}\`."
+            echo "If it needs a code fix, delete the draft release and the tag by hand, then tag the fixed commit."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Release ${{ github.ref_name }} failed on attempt ${{ github.run_attempt }}; draft release and tag kept"
